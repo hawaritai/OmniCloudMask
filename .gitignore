@@ -27,3 +27,6 @@ examples/PlanetScope data/*
 tests/speed test/speed test scenes/*
 *.gpkg
 *.tif
+*.png
+ckpts/
+models/
