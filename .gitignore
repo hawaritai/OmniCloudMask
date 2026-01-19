@@ -30,3 +30,5 @@ tests/speed test/speed test scenes/*
 *.png
 ckpts/
 models/
+*.pyc
+validation dataset/Throughput/speed test scenes/*
