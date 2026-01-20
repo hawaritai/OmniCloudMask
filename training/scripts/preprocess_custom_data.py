@@ -67,15 +67,21 @@ except ImportError:
 TARGET_GSD_M = 10.0  # Target resolution in meters (Match Sentinel-2 approx)
 SOURCE_GSD_M = 1  # Your source resolution (5cm) - ADJUST IF NEEDED
 TILE_SIZE = 509      # Required by OCM training script
+
+# --- PREPROCESSING METHOD TOGGLE ---
+# False: Use RGBNIRHandler with normalization (Method A)
+# True: Use Clamp & Scale (Red*3, Green*2, NIR*1) (Method B)
+USE_METHOD_B_PREPROCESSING = False 
 # ---------------------
 
 def preprocess_images():
     # Setup Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Preprocessing Method: {'Clamp & Scale (Method B)' if USE_METHOD_B_PREPROCESSING else 'RGBNIRHandler (Method A)'}")
 
-    # Initialize Handler
-    handler = RGBNIRHandler(device=device)
+    # Initialize Handler (only needed for Method A)
+    handler = RGBNIRHandler(device=device) if not USE_METHOD_B_PREPROCESSING else None
 
     # Create output directories
     (OUTPUT_DIR / "train").mkdir(parents=True, exist_ok=True)
@@ -110,9 +116,7 @@ def preprocess_images():
 
                 # 2. Read and Resample (Downsample) entire image to memory
                 # Read RGB (3 bands)
-                # Ensure we read only first 3 bands if there are more
                 count = min(3, src_img.count)
-                # We expect at least 3 bands for RGB
                 if count < 3:
                     print(f"Skipping {img_path.name}: Not enough bands ({count})")
                     continue
@@ -131,58 +135,75 @@ def preprocess_images():
 
                 # --- 2b. Generate NIR and Stack ---
                 # Prepare RGB for NIRGAN (H, W, 3)
-                # data_img_rgb is (3, H, W)
                 rgb_for_gan = np.transpose(data_img_rgb, (1, 2, 0)) # CHW -> HWC
                 
-                # Generate NIR (returns (H, W) scaled to 0-10000 usually)
-                # Note: get_NIR might expect 0-255 uint8 or float 0-1.
-                # data_img_rgb is likely uint8 or uint16 depending on source.
-                # create_NIR.to_tensor divides by 255 if it detects uint8? No, let's check create_NIR code.
-                # It does: `tensor = torch.from_numpy(arr.transpose((2, 0, 1))).float() / 255.0`
-                # So it assumes 0-255 input!
-                
-                # Check dtype
+                # Check dtype & Scale to 0-255 for GAN
                 if data_img_rgb.dtype == np.uint16:
-                    # Scale to 0-255 for GAN? Or normalize?
-                    # The GAN expects [0,1] or [0,255].
-                    # Let's normalize to 0-255 roughly for GAN input
-                    rgb_for_gan = (rgb_for_gan / 65535.0 * 255.0).astype(np.uint8)
+                    rgb_for_gan_u8 = (rgb_for_gan / 65535.0 * 255.0).astype(np.uint8)
                 elif data_img_rgb.dtype != np.uint8:
-                    # If float, assume 0-1?
                     if data_img_rgb.max() <= 1.0:
-                        rgb_for_gan = (rgb_for_gan * 255.0).astype(np.uint8)
-                
+                        rgb_for_gan_u8 = (rgb_for_gan * 255.0).astype(np.uint8)
+                    else:
+                         rgb_for_gan_u8 = rgb_for_gan.astype(np.uint8)
+                else:
+                    rgb_for_gan_u8 = rgb_for_gan
+
                 # Now run GAN
-                nir_synthetic = get_NIR(rgb_for_gan, device=device)
+                nir_synthetic = get_NIR(rgb_for_gan_u8, device=device)
                 
                 # --- RESIZE NIR TO MATCH RGB IF NEEDED ---
                 if nir_synthetic.shape != (new_height, new_width):
-                    # Ensure nir_synthetic is float32 for resizing
                     nir_synthetic = nir_synthetic.astype(np.float32)
-                    
-                    # cv2.resize expects (width, height)
                     nir_synthetic = cv2.resize(nir_synthetic, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
 
-                # Stack using handler [Scaled R, Scaled G, NIR]
-                # RGBNIRHandler.stack_rgb_nir expects 2D arrays (H, W).
-                # It can handle normalization.
-                # We pass the original downsampled bands (red, green) to preserve radiometric quality if possible,
-                # but we need to pass them as float32 for the handler.
+                # --- STACKING LOGIC ---
+                if USE_METHOD_B_PREPROCESSING:
+                    # --- METHOD B: Clamp & Scale ---
+                    # Logic from cloud_shadow_detect_main.py:
+                    # red = clamp(input * 3, 0, 65535)
+                    # green = clamp(input * 2, 0, 65535)
+                    # nir = clamp(nir * 1, 0, 65535)
+                    
+                    # Ensure inputs are float for math
+                    r = data_img_rgb[0].astype(np.float32)
+                    g = data_img_rgb[1].astype(np.float32)
+                    n = nir_synthetic.astype(np.float32)
+                    
+                    # Normalize inputs to 0-1 range first if they aren't already
+                    # Assuming input might be uint8 or uint16.
+                    # Method B usually expects roughly "visual" values to be multiplied.
+                    # Let's check source: `rgb_tensor_resized[0] * 3`. `rgb_tensor_resized` came from `rgb_array` (0-255 if uint8, or 0-1 float).
+                    # If source is uint8 (0-255): 255 * 3 = 765. Not 65535.
+                    # If source is uint16 (0-65535): 65535 * 3 >> 65535.
+                    # Actually `cloud_shadow_detect_main.py` reads with rasterio, gets whatever dtype. 
+                    # If we assume standard RGB (0-255), then the output is approx 0-765 range.
+                    # If we assume 16-bit, it saturates immediately.
+                    # Let's assume we want to map the *relative* intensity.
+                    
+                    # Implementation detail: The user's provided script uses `rgb_tensor_resized` which came from `rgb_array`.
+                    # It likely expects standard normalized input or raw DNs.
+                    # We will implement exact logic: Raw Value * Factor.
+                    
+                    r_scaled = np.clip(r * 3, 0, 65535)
+                    g_scaled = np.clip(g * 2, 0, 65535)
+                    n_scaled = np.clip(n * 1, 0, 65535)
+                    
+                    rgn_stack = np.stack([r_scaled, g_scaled, n_scaled], axis=0).astype(np.float32)
+                    
+                else:
+                    # --- METHOD A: RGBNIRHandler (Normalized) ---
+                    red = data_img_rgb[0].astype(np.float32)
+                    green = data_img_rgb[1].astype(np.float32)
+                    
+                    rgn_stack = handler.stack_rgb_nir(
+                        red=red,
+                        green=green,
+                        nir=nir_synthetic,
+                        normalize=True,
+                        scale_to_dn=True,
+                        dn_range=(0, 10000)
+                    )
                 
-                red = data_img_rgb[0].astype(np.float32)
-                green = data_img_rgb[1].astype(np.float32)
-                
-                # Use handler to stack and scale
-                # scale_to_dn=True will scale normalized [0,1] R/G to [0,10000]
-                # The handler normalizes input red/green first.
-                rgn_stack = handler.stack_rgb_nir(
-                    red=red,
-                    green=green,
-                    nir=nir_synthetic,
-                    normalize=True,
-                    scale_to_dn=True,
-                    dn_range=(0, 10000)
-                )
                 # rgn_stack is (3, H, W) float32
 
                 # 3. Tile into 509x509 patches

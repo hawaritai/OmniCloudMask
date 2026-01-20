@@ -64,6 +64,11 @@ MODEL_PATCH_SIZE = (509, 509)
 SCALE_FACTOR = 0.1 # Match the training preprocessing (1m -> 10m GSD = 0.1)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# --- INFERENCE METHOD TOGGLE ---
+# True: Use Dual-Res (480x520 + 160x220) + Clamp Scaling (Red*3 etc.)
+# False: Use Z-Score Norm + Tiled Inference (Current Training Default)
+USE_DUAL_RES_METHOD = False 
+
 # Path to the fine-tuned model
 MODEL_PATH = TEST_MODEL_PATH
 
@@ -78,6 +83,7 @@ class OCMTester:
         self.output_dir = OUTPUT_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Output directory: {self.output_dir}")
+        print(f"Inference Method: {'Dual-Res (New)' if USE_DUAL_RES_METHOD else 'Z-Score Tiled (Legacy)'}")
 
     def _load_model(self, model_path: Path):
         print(f"Loading model from {model_path}...")
@@ -133,6 +139,41 @@ class OCMTester:
         
         normalized = torch.where(mask, (x - mean) / std, torch.zeros_like(x))
         return normalized.cpu().numpy()
+
+    def prepare_input_array_dual_res(self, rgb_array: np.ndarray, to_size) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Prepares the R-G-NIR stack using Clamp & Scale logic (Method B).
+        """
+        if rgb_array.shape[2] == 4:  # RGBA
+            rgb_array = rgb_array[:, :, :3]
+        
+        # Convert to CHW format (Channels, Height, Width)
+        rgb_chw = np.transpose(rgb_array, (2, 0, 1))
+        rgb_tensor = torch.tensor(rgb_chw, dtype=torch.float32, device=self.device)
+
+        # Downsample
+        rgb_tensor_resized = torch.nn.functional.interpolate(
+            rgb_tensor.unsqueeze(0),
+            size=to_size,
+            mode="area").squeeze(0)
+   
+        # HWC for NIRGAN
+        rgb_for_nir_gan = rgb_tensor_resized.permute(1, 2, 0).cpu().numpy()
+        
+        # Generate synthetic NIR
+        nir = get_NIR(rgb_for_nir_gan, device=self.device)
+        nir = torch.tensor(nir, dtype=torch.float32, device=self.device)
+        if nir.ndim == 2:
+            nir = nir.unsqueeze(0)  # (1, H, W)
+            
+        # Scale red, green and nir bands (Specific to Method B)
+        red = torch.clamp(rgb_tensor_resized[0] * 3, 0, 65535)
+        green = torch.clamp(rgb_tensor_resized[1] * 2, 0, 65535)
+        nir = torch.clamp(nir * 1, 0, 65535)
+        
+        # Stack
+        rgn_stack = torch.stack([red, green, nir.squeeze(0)], dim=0)
+        return rgn_stack.cpu().numpy(), rgb_tensor_resized.cpu().numpy()
 
     def mask_shadow_confidence(self, result, conf_thresh=-0.1):
         """
@@ -205,8 +246,75 @@ class OCMTester:
         
         return cloud_mask, avg_conf_cloud
 
+    def process_image_dual_res(self, image_path: Path):
+        """
+        Method B: Dual Resolution + Clamp Scaling
+        """
+        print(f"Processing (Dual Res) {image_path.name}...")
+        try:
+            with rio.open(image_path) as src:
+                rgb_array = np.transpose(src.read([1, 2, 3]), (1, 2, 0))
+
+            RES_DEFAULT = (480, 520)
+            RES_SMALL = (160, 220)
+
+            # 1. Prepare Default Res
+            rgb_input_def, rgb_resized_def = self.prepare_input_array_dual_res(rgb_array, to_size=RES_DEFAULT)
+            # 2. Prepare Small Res
+            rgn_input_small, _ = self.prepare_input_array_dual_res(rgb_array, to_size=RES_SMALL)
+
+            # --- Small Res Inference ---
+            mask_conf_small = predict_from_array(
+                rgn_input_small, 
+                custom_models=[self.model],
+                inference_device=self.device,
+                export_confidence=True,
+                batch_size=1, # Dual res is single image based
+                patch_size=2000 # Large patch size to avoid tiling on small images
+            )
+            shadow_mask_small, _ = self.mask_shadow_confidence(mask_conf_small, conf_thresh=0.1)
+            cloud_mask_small, _ = self.mask_cloud_confidence(mask_conf_small, conf_thresh=0.1)
+
+            # --- Default Res Inference ---
+            mask_conf_def = predict_from_array(
+                rgb_input_def, 
+                custom_models=[self.model],
+                inference_device=self.device,
+                export_confidence=True,
+                batch_size=1,
+                patch_size=2000
+            )
+            shadow_mask_def, _ = self.mask_shadow_confidence(mask_conf_def, conf_thresh=0.1)
+            cloud_mask_def, _ = self.mask_cloud_confidence(mask_conf_def, conf_thresh=0.1)
+
+            # --- Upscale Small & Merge ---
+            target_size = (RES_DEFAULT[1], RES_DEFAULT[0]) # (W, H)
+            
+            shadow_mask_small_upscaled = cv2.resize(shadow_mask_small.astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST)
+            cloud_mask_small_upscaled = cv2.resize(cloud_mask_small.astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST)
+
+            final_shadow = shadow_mask_def | shadow_mask_small_upscaled
+            final_cloud = cloud_mask_def | cloud_mask_small_upscaled
+            
+            final_mask = np.zeros(RES_DEFAULT, dtype=np.uint8)
+            final_mask[final_shadow == 3] = 3
+            final_mask[final_cloud == 1] = 1
+
+            # Save visualization (Using the Default Res RGB)
+            # Need to transpose rgb_resized_def back to HWC for viz
+            rgb_viz = np.transpose(rgb_resized_def, (1, 2, 0))
+            self.save_visualization(rgb_viz, final_mask, image_path.stem)
+
+        except Exception as e:
+            print(f"Error processing {image_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
+
     def process_image(self, image_path: Path):
-        print(f"Processing {image_path.name}...")
+        """
+        Method A: Z-Score Tiled (Legacy)
+        """
+        print(f"Processing (Z-Score) {image_path.name}...")
         
         try:
             with rio.open(image_path) as src:
@@ -356,4 +464,7 @@ if __name__ == "__main__":
         print(f"Found {len(images)} images. Processing...")
         # Process a few samples to save time, or all
         for img_path in images: # Process first 5 for testing
-            tester.process_image(img_path)
+            if USE_DUAL_RES_METHOD:
+                tester.process_image_dual_res(img_path)
+            else:
+                tester.process_image(img_path)
