@@ -60,7 +60,8 @@ except ImportError:
 MODEL_TYPE = "regnety_004.pycls_in1k"
 NUM_CHANNELS = 3  # R, G, NIR
 MODEL_PATCH_SIZE = (509, 509)
-TARGET_RESOLUTION = (480, 520) # (Height, Width)
+# TARGET_RESOLUTION = (480, 520) # Deprecated
+SCALE_FACTOR = 0.1 # Match the training preprocessing (1m -> 10m GSD = 0.1)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Path to the fine-tuned model
@@ -144,32 +145,41 @@ class OCMTester:
                     print(f"Skipping {image_path.name}: Expected 3 bands, got {rgb.shape[0]}")
                     return
 
-            # --- DOWNSAMPLE LOGIC ---
-            # Transpose to HWC for resizing
+            # Transpose to HWC
             rgb_hwc = np.transpose(rgb, (1, 2, 0))
-            h_target, w_target = TARGET_RESOLUTION
+            h_native, w_native = rgb_hwc.shape[:2]
+
+            # --- DOWNSAMPLE to Match Training Scale ---
+            # Training used ~10m GSD (Scale 0.1 from ~1m source)
+            # We must replicate this or the model will see "zoomed in" noise
+            h_infer = int(h_native * SCALE_FACTOR)
+            w_infer = int(w_native * SCALE_FACTOR)
             
-            print(f"Downsampling to {w_target}x{h_target}...")
-            rgb_resized_hwc = cv2.resize(rgb_hwc, (w_target, h_target), interpolation=cv2.INTER_AREA)
+            # Ensure minimum size (at least 32x32 for model stability, though OCM handles padding)
+            h_infer = max(h_infer, 64)
+            w_infer = max(w_infer, 64)
+
+            print(f"Downsampling Input: {w_native}x{h_native} -> {w_infer}x{h_infer} (Scale: {SCALE_FACTOR})")
+            rgb_infer = cv2.resize(rgb_hwc, (w_infer, h_infer), interpolation=cv2.INTER_AREA)
 
             # --- GENERATE NIR ---
-            # Normalize for NIRGAN input if needed
-            if rgb_resized_hwc.dtype != np.uint8:
-                rgb_gan = ((rgb_resized_hwc - rgb_resized_hwc.min()) / (rgb_resized_hwc.max() - rgb_resized_hwc.min() + 1e-8) * 255).astype(np.uint8)
+            # Prepare for GAN (requires 0-255 uint8)
+            if rgb_infer.dtype != np.uint8:
+                rgb_gan_input = ((rgb_infer - rgb_infer.min()) / (rgb_infer.max() - rgb_infer.min() + 1e-8) * 255).astype(np.uint8)
             else:
-                rgb_gan = rgb_resized_hwc
+                rgb_gan_input = rgb_infer
 
             print("Generating synthetic NIR...")
-            nir = get_NIR(rgb_gan, device=self.device)
+            nir_infer = get_NIR(rgb_gan_input, device=self.device)
             
-            # NIR should already be at target resolution, but ensure exact match
-            if nir.shape != (h_target, w_target):
-                nir = cv2.resize(nir, (w_target, h_target), interpolation=cv2.INTER_LINEAR)
+            # Ensure shape match exactly
+            if nir_infer.shape != (h_infer, w_infer):
+                 nir_infer = cv2.resize(nir_infer, (w_infer, h_infer), interpolation=cv2.INTER_LINEAR)
 
             # --- PREPARE STACK ---
-            red = rgb_resized_hwc[:, :, 0].astype(np.float32)
-            green = rgb_resized_hwc[:, :, 1].astype(np.float32)
-            nir = nir.astype(np.float32)
+            red = rgb_infer[:, :, 0].astype(np.float32)
+            green = rgb_infer[:, :, 1].astype(np.float32)
+            nir = nir_infer.astype(np.float32)
             
             rgn_stack = np.stack([red, green, nir], axis=0) # (3, H, W)
             
@@ -177,8 +187,9 @@ class OCMTester:
             rgn_norm = self.z_score_normalize(rgn_stack)
             
             # --- INFERENCE ---
-            print("Running inference...")
-            mask = predict_from_array(
+            print(f"Running inference on scaled image ({w_infer}x{h_infer})...")
+            # predict_from_array will tile this scaled image if it's larger than 509x509
+            mask_infer = predict_from_array(
                 rgn_norm,
                 custom_models=[self.model],
                 inference_device=self.device,
@@ -186,10 +197,16 @@ class OCMTester:
                 patch_size=MODEL_PATCH_SIZE[0]
             )
             
-            final_mask = mask[0]
+            final_mask = mask_infer[0]
+            # mask_low_res = mask_infer[0] # (H_infer, W_infer)
+
+            # # --- UPSAMPLE RESULT ---
+            # # Resize the mask back to native resolution for overlay
+            # print(f"Upsampling Mask: {w_infer}x{h_infer} -> {w_native}x{h_native}")
+            # final_mask = cv2.resize(mask_low_res, (w_native, h_native), interpolation=cv2.INTER_NEAREST)
             
             # --- SAVE RESULT ---
-            self.save_visualization(rgb_resized_hwc, final_mask, image_path.stem)
+            self.save_visualization(rgb_hwc, final_mask, image_path.stem)
             
         except Exception as e:
             print(f"Error processing {image_path.name}: {e}")
