@@ -15,17 +15,24 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # --- CONFIGURATION ---
-BASE_DIR = Path(r"D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\1_Data\\training\\2051_102025077_D09_Arriege_D")
-# Note: User provided path differs slightly in previous prompt vs 'working dir' context.
-# I will use the path relative to the repo if possible, or the absolute path provided.
-# The user provided: D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\1_Data\\training\\2051_102025077_D09_Arriege_D
-# But earlier ls showed: D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\2_Repo\\OmniCloudMask\\training\\data\\2051_102025077_D09_Arriege_D
-# I'll try to find where the data actually is. The 'ls' command in the previous turn worked on the '2_Repo' path.
-# So I will use that one.
+# Default CRS for the project (France)
+PROJECT_CRS = "EPSG:2154" 
 
-IMAGE_DIR = Path(r"D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\2_Repo\\OmniCloudMask\\training\\data\\2051_102025077_D09_Arriege_D\\images")
-GPKG_DIR = Path(r"D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\2_Repo\\OmniCloudMask\\training\\data\\2051_102025077_D09_Arriege_D\\gpkg")
-OUTPUT_DIR = Path(r"D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\2_Repo\\OmniCloudMask\\training\\data\\2051_102025077_D09_Arriege_D\\masks")
+try:
+    from local_config import (
+        PREPARE_MASKS_IMAGE_DIR,
+        PREPARE_MASKS_GPKG_DIR,
+        PREPARE_MASKS_OUTPUT_DIR
+    )
+    IMAGE_DIR = PREPARE_MASKS_IMAGE_DIR
+    GPKG_DIR = PREPARE_MASKS_GPKG_DIR
+    OUTPUT_DIR = PREPARE_MASKS_OUTPUT_DIR
+except ImportError:
+    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    # Fallback to prevent immediate crash if user is just reading code, but will likely fail later
+    IMAGE_DIR = Path("DATA_DIR_NOT_SET/images")
+    GPKG_DIR = Path("DATA_DIR_NOT_SET/gpkg")
+    OUTPUT_DIR = Path("DATA_DIR_NOT_SET/masks_2")
 
 # CLASS MAPPING
 # 'Remark' attribute values -> Integer Class ID
@@ -47,12 +54,23 @@ def process_masks():
 
     for img_path in tqdm(image_files):
         try:
+            # Check for World File (.tfw)
+            tfw_path = img_path.with_suffix(".tfw")
+            is_georeferenced = tfw_path.exists()
+
             # 1. Read Image Metadata
             with rasterio.open(img_path) as src:
                 height, width = src.shape
                 src_profile = src.profile.copy()
-                # Create a default transform for the mask (0,0 top-left)
-                dst_transform = rasterio.Affine(1, 0, 0, 0, 1, 0)
+                
+                if is_georeferenced:
+                     # Use the image's transform (rasterio reads .tfw automatically if present)
+                    dst_transform = src.transform
+                    dst_crs = PROJECT_CRS
+                else:
+                    # Create a default transform for the mask (0,0 top-left) for pixel coords
+                    dst_transform = rasterio.Affine(1, 0, 0, 0, 1, 0)
+                    dst_crs = None
             
             # Create empty mask (black mask by default)
             mask = np.zeros((height, width), dtype=np.uint8)
@@ -68,15 +86,28 @@ def process_masks():
                     print(f"Warning: 'Remark' column missing in {gpkg_path.name}. Generating black mask.")
                 else:
                     # 3. Coordinate Transformation Logic
-                    bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
-                    min_y, max_y = bounds[1], bounds[3]
-                    
-                    # Helper to flip Y
-                    def flip_y(geom):
-                        return scale(geom, xfact=1.0, yfact=-1.0, origin=(0,0))
-                    
-                    if max_y <= 0:
-                        gdf['geometry'] = gdf['geometry'].apply(flip_y)
+                    if is_georeferenced:
+                        # Georeferenced Case (TIF has .tfw, GPKG drawn on top of it)
+                        # We ASSUME the GPKG coordinates are already in the same system as the TIF
+                        # (even if the GPKG has a dummy CRS like 28992).
+                        # So we do NOT reproject. We just use the coordinates as-is.
+                        
+                        # We might want to ensure the CRS is set to Project CRS for metadata purposes if we were saving the GPKG,
+                        # but for rasterization, we just need the raw coordinates to match the transform.
+                        pass 
+                            
+                    else:
+                        # Non-georeferenced logic (Pixel coordinates)
+                        bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
+                        min_y, max_y = bounds[1], bounds[3]
+                        
+                        # Helper to flip Y
+                        def flip_y(geom):
+                            return scale(geom, xfact=1.0, yfact=-1.0, origin=(0,0))
+                        
+                        # If coordinates look like they are flipped (negative Y), flip them back
+                        if max_y <= 0:
+                            gdf['geometry'] = gdf['geometry'].apply(flip_y)
                     
                     # Filter and Rasterize
                     shapes_to_burn = []
@@ -113,7 +144,8 @@ def process_masks():
                 'count': 1,
                 'compress': 'lzw',
                 'nodata': 99, 
-                'transform': dst_transform 
+                'transform': dst_transform,
+                'crs': dst_crs
             })
             
             with rasterio.open(out_path, 'w', **profile) as dst:

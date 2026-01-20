@@ -61,8 +61,17 @@ def main():
 
     warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
+    # --- LOCAL CONFIG IMPORT ---
+    try:
+        if str(current_script_dir) not in sys.path:
+            sys.path.append(str(current_script_dir))
+        from local_config import TRAIN_DATA_DIR, TRAIN_PRETRAINED_WEIGHTS_PATH
+    except ImportError:
+        print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+        sys.exit(1)
+
     # --- PATHS ---
-    base_data_path = Path(r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\2_Repo\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D\processed_dataset_2")
+    base_data_path = TRAIN_DATA_DIR
     
     my_custom_data_dir = base_data_path / "train"
     my_custom_val_dir = base_data_path / "validation"
@@ -132,7 +141,7 @@ def main():
 
     # --- LOAD PRETRAINED WEIGHTS ---
     # Path to the specific checkpoint
-    pretrained_weights_path = project_root / "ckpts" / "PM_model_OCM_7.43_R_G_NIR_regnety_004.pycls_in1k_PT_state.safetensors"
+    pretrained_weights_path = TRAIN_PRETRAINED_WEIGHTS_PATH
     
     if pretrained_weights_path.exists():
         print(f"Loading pretrained weights from {pretrained_weights_path}")

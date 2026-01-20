@@ -47,6 +47,15 @@ except ImportError as e:
         print(f"Critical Import Error: {e2}")
         sys.exit(1)
 
+# --- LOCAL CONFIG IMPORT ---
+try:
+    if str(current_script_dir) not in sys.path:
+        sys.path.append(str(current_script_dir))
+    from local_config import TEST_MODEL_PATH, TEST_IMAGES_DIR as CFG_TEST_IMAGES_DIR, TEST_OUTPUT_DIR
+except ImportError:
+    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    sys.exit(1)
+
 # --- CONFIGURATION ---
 MODEL_TYPE = "regnety_004.pycls_in1k"
 NUM_CHANNELS = 3  # R, G, NIR
@@ -55,11 +64,11 @@ TARGET_RESOLUTION = (480, 520) # (Height, Width)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Path to the fine-tuned model
-MODEL_PATH = project_root / "models" / "PM_model_OCM_7.43_R_G_NIR_test_regnety_004.pycls_in1k_PT_state.safetensors"
+MODEL_PATH = TEST_MODEL_PATH
 
 # Test Data Directory
-TEST_IMAGES_DIR = project_root / "training" / "data" / "2051_102025077_D09_Arriege_D" / "images"
-OUTPUT_DIR = project_root / "test_results"
+TEST_IMAGES_DIR = CFG_TEST_IMAGES_DIR
+OUTPUT_DIR = TEST_OUTPUT_DIR
 
 class OCMTester:
     def __init__(self, model_path: Path):

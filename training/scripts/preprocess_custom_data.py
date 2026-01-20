@@ -49,11 +49,20 @@ except ImportError as e:
         sys.exit(1)
 
 # --- CONFIGURATION ---
-# UPDATE THESE PATHS TO MATCH YOUR LOCAL SETUP
-BASE_DATA_DIR = Path(r"D:\\Projects\\QI47\\2025_Projects\\Image_QC_GUI\\2_Repo\\OmniCloudMask\\training\\data\\2051_102025077_D09_Arriege_D")
-INPUT_IMAGES_DIR = BASE_DATA_DIR / "images"
-INPUT_LABELS_DIR = BASE_DATA_DIR / "masks"
-OUTPUT_DIR = BASE_DATA_DIR / "processed_dataset_2" # Where to save training chips
+try:
+    from local_config import (
+        PREPROCESS_BASE_DIR,
+        PREPROCESS_INPUT_IMAGES_DIR,
+        PREPROCESS_INPUT_LABELS_DIR,
+        PREPROCESS_OUTPUT_DIR
+    )
+    BASE_DATA_DIR = PREPROCESS_BASE_DIR
+    INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR
+    INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR
+    OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
+except ImportError:
+    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    sys.exit(1)
 
 TARGET_GSD_M = 10.0  # Target resolution in meters (Match Sentinel-2 approx)
 SOURCE_GSD_M = 1  # Your source resolution (5cm) - ADJUST IF NEEDED
