@@ -116,8 +116,9 @@ def main():
         unfrozen_epochs = 5
         limit_training_images = 3000
     else:
-        freeze_epochs = 50
-        unfrozen_epochs = 50
+        # Default for custom fine-tuning: Conservative epoch count to prevent catastrophic forgetting
+        freeze_epochs = 6
+        unfrozen_epochs = 12
         limit_training_images = None
 
     num_input_channels = len(limited_band_read_list)
