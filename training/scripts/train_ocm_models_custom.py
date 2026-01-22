@@ -50,6 +50,7 @@ try:
         CrossEntropyLossFlatImageTypeWeighted,
     )
     from helpers import plot_batch, show_histo, print_system_info
+    from eval_utils import compute_and_plot_metrics
 except ImportError as e:
     print(f"Error importing local modules: {e}")
     print(f"sys.path: {sys.path}")
@@ -65,7 +66,12 @@ def main():
     try:
         if str(current_script_dir) not in sys.path:
             sys.path.append(str(current_script_dir))
-        from local_config import TRAIN_DATA_DIR, TRAIN_PRETRAINED_WEIGHTS_PATH
+        from local_config import (
+            TRAIN_DATA_DIR, 
+            TRAIN_PRETRAINED_WEIGHTS_PATH,
+            CUSTOM_MODEL_VERSION,
+            USE_DUAL_RES_METHOD
+        )
     except ImportError:
         print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
         sys.exit(1)
@@ -82,7 +88,7 @@ def main():
     # --- CONFIGURATION ---
     # Set model type to match the checkpoint we want to fine-tune
     model_type = "regnety_004.pycls_in1k" 
-    model_version = "OCM_7.43_R_G_NIR_test_3"
+    model_version = CUSTOM_MODEL_VERSION
     
     use_bf16 = True
     demo_mode = False
@@ -91,7 +97,13 @@ def main():
     max_clip_image_clip_size = 400
     min_clip_image_size = 256
     limited_band_read_list = [1, 2, 3]  # Red Green NIR
-    native_band_scales = [1, 1, 1]
+    
+    # Scale bands according to method:
+    # Dual Res method uses [Red*3, Green*2, NIR*1] scaling instead of Z-score
+    if USE_DUAL_RES_METHOD:
+        native_band_scales = [3, 2, 1]
+    else:
+        native_band_scales = [1, 1, 1]
     
     gradient_accumulation_batch_size = 128
     batch_size = 10
@@ -417,6 +429,34 @@ def main():
         json.dump(config, f, indent=4)
         
     print(f"Training complete. Models saved to {models_dir}")
+
+    # --- EVALUATION ---
+    print("\n--- Starting Evaluation ---")
+    results_dir = models_dir / f"results_{model_version}"
+    
+    # Validation Set
+    try:
+        compute_and_plot_metrics(
+            learner, 
+            dl=dl.valid, 
+            dataset_name="Validation", 
+            save_dir=results_dir,
+            class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+        )
+    except Exception as e:
+        print(f"Error evaluating validation set: {e}")
+
+    # Training Set
+    try:
+        compute_and_plot_metrics(
+            learner, 
+            dl=dl.train, 
+            dataset_name="Training", 
+            save_dir=results_dir,
+            class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+        )
+    except Exception as e:
+        print(f"Error evaluating training set: {e}")
 
 if __name__ == "__main__":
     main()

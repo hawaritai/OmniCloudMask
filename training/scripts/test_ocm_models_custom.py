@@ -51,7 +51,12 @@ except ImportError as e:
 try:
     if str(current_script_dir) not in sys.path:
         sys.path.append(str(current_script_dir))
-    from local_config import TEST_MODEL_PATH, TEST_IMAGES_DIR as CFG_TEST_IMAGES_DIR, TEST_OUTPUT_DIR
+    from local_config import (
+        TEST_MODEL_PATH, 
+        TEST_IMAGES_DIR as CFG_TEST_IMAGES_DIR, 
+        TEST_OUTPUT_DIR,
+        USE_DUAL_RES_METHOD as CFG_USE_DUAL_RES_METHOD
+    )
 except ImportError:
     print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
     sys.exit(1)
@@ -67,7 +72,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --- INFERENCE METHOD TOGGLE ---
 # True: Use Dual-Res (480x520 + 160x220) + Clamp Scaling (Red*3 etc.)
 # False: Use Z-Score Norm + Tiled Inference (Current Training Default)
-USE_DUAL_RES_METHOD = False 
+USE_DUAL_RES_METHOD = CFG_USE_DUAL_RES_METHOD 
 
 # Path to the fine-tuned model
 MODEL_PATH = TEST_MODEL_PATH
