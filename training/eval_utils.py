@@ -1,5 +1,8 @@
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Add this FIRST
+
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, precision_recall_curve, average_precision_score
 from pathlib import Path
@@ -28,27 +31,153 @@ def compute_and_plot_metrics(learner, dl, dataset_name, save_dir, class_names=No
     
     # Get predictions
     # preds: [N, C, H, W], targs: [N, H, W]
-    preds_tensor, targs_tensor = learner.get_preds(dl=dl)
+    preds_result = learner.get_preds(dl=dl)
     
-    # Convert to probabilities (softmax)
-    probs_tensor = torch.softmax(preds_tensor, dim=1)
+    # Handle different return types from get_preds
+    if isinstance(preds_result, tuple):
+        preds_output, targs_output = preds_result[0], preds_result[1]
+    else:
+        preds_output, targs_output = preds_result, preds_result
+
+    # Helper to extract mask from (mask, weights) tuple if present
+    def extract_mask(t):
+        # If it's a tuple/list of tensors, check if it looks like (mask, weights)
+        if isinstance(t, (tuple, list)) and len(t) >= 2:
+            if isinstance(t[0], torch.Tensor) and isinstance(t[1], torch.Tensor):
+                # Heuristic: weights usually have one less dimension or different shape
+                if t[0].shape != t[1].shape:
+                    return t[0]
+        return t
+
+    valid_preds_list = []
+    valid_targs_list = []
+    valid_probs_list = []
+
+    # Check if we have a list of batches (variable sizes) or a single tensor
+    # FastAI L is iterable but not isinstance(list)
+    is_list_of_batches = (hasattr(preds_output, '__iter__') and not isinstance(preds_output, torch.Tensor))
     
-    # Flatten for metric calculation
-    # Move to CPU and numpy
-    # We process in chunks or all at once? 
-    # For hundreds of images (509x509), flat arrays will be large.
-    # 500 images * 500 * 500 = 125,000,000 pixels.
-    # This fits in RAM (125M * 4 bytes ~ 500MB).
+    # If it's a single tensor, wrap it in a list to treat it uniformly as a "single batch"
+    if not is_list_of_batches:
+        preds_batches = [preds_output]
+        targs_batches = [targs_output]
+    else:
+        preds_batches = list(preds_output) # Convert L to list
+        targs_batches = list(targs_output)
+
+    print(f"Processing {len(preds_batches)} batches/items for metrics...")
+
+    for batch_idx, (p_batch, t_batch) in enumerate(zip(preds_batches, targs_batches)):
+        # p_batch: [B, C, H, W] (or [C, H, W] if not batched, but get_preds usually batches)
+        # t_batch: [B, H, W] or tuple ([B, H, W], [B])
+        
+        # Convert FastAI L to standard list if encountered
+        if hasattr(p_batch, '__iter__') and not isinstance(p_batch, torch.Tensor):
+            p_batch = list(p_batch)
+        if hasattr(t_batch, '__iter__') and not isinstance(t_batch, torch.Tensor):
+            t_batch = list(t_batch)
+
+        # 1. Handle (mask, weights) tuple in target
+        t_mask = extract_mask(t_batch)
+        
+        # If t_mask became a list (from L conversion or extract_mask), ensure it's a list
+        if hasattr(t_mask, '__iter__') and not isinstance(t_mask, torch.Tensor):
+            t_mask = list(t_mask)
+
+        # 2. Ensure tensors and move to CPU
+        # If p_batch is a list of tensors (variable size batch), we cannot convert to tensor directly
+        is_var_size = isinstance(p_batch, list) and len(p_batch) > 0 and isinstance(p_batch[0], torch.Tensor)
+        
+        if not is_var_size and not isinstance(p_batch, torch.Tensor):
+             try:
+                 p_batch = torch.as_tensor(p_batch)
+             except Exception as e:
+                 # It might be a list of tensors that failed the is_var_size check?
+                 pass
+
+        # Same for t_mask
+        is_mask_list = isinstance(t_mask, list) and len(t_mask) > 0 and isinstance(t_mask[0], torch.Tensor)
+        
+        if not is_mask_list and not isinstance(t_mask, torch.Tensor):
+             try:
+                t_mask = torch.as_tensor(t_mask)
+             except TypeError:
+                 pass # Will be handled below if it's a list
+
+        # Handle case where t_mask is still a list (variable sized batch)
+        if isinstance(t_mask, (list, tuple)) and isinstance(p_batch, (list, tuple, torch.Tensor)):
+            # If t_mask is a list, p_batch should also be iterable matching it
+            # We will iterate inside this batch
+            sub_probs = []
+            sub_targs = []
+            
+            # Ensure p_batch is iterable
+            if isinstance(p_batch, torch.Tensor):
+                p_iterable = p_batch # Iterating tensor [B, C, H, W] gives [C, H, W] slices
+            else:
+                p_iterable = p_batch
+            
+            # If lengths don't match, something is wrong, but zip will truncate
+            for sub_p, sub_t in zip(p_iterable, t_mask):
+                sub_p = sub_p.cpu() if isinstance(sub_p, torch.Tensor) else torch.as_tensor(sub_p).cpu()
+                sub_t = sub_t.cpu() if isinstance(sub_t, torch.Tensor) else torch.as_tensor(sub_t).cpu()
+                
+                # sub_p might be [C, H, W]
+                sp_probs = torch.softmax(sub_p, dim=0) # [C, H, W] -> softmax over C
+                
+                # Flatten
+                num_c = sp_probs.shape[0]
+                sp_flat = sp_probs.permute(1, 2, 0).reshape(-1, num_c)
+                st_flat = sub_t.flatten()
+                
+                m = st_flat != ignore_index
+                if m.sum() > 0:
+                    sub_probs.append(sp_flat[m].numpy())
+                    sub_targs.append(st_flat[m].numpy())
+            
+            if sub_probs:
+                valid_probs_list.extend(sub_probs)
+                valid_targs_list.extend(sub_targs)
+            continue # Skip standard processing for this batch
+
+        p_batch = p_batch.cpu()
+        t_mask = t_mask.cpu()
+
+        # 3. Compute Softmax (Probabilities)
+        # p_batch is [B, C, H, W]
+        probs = torch.softmax(p_batch, dim=1)
+        
+        # 4. Flatten Spatial Dimensions
+        # We need to pair every pixel prediction with its target.
+        # Permute to [B, H, W, C] then flatten to [N_pixels, C]
+        num_classes = probs.shape[1]
+        probs_flat = probs.permute(0, 2, 3, 1).reshape(-1, num_classes)
+        targs_flat = t_mask.flatten()
+        
+        # 5. Filter Ignore Index
+        # This drastically reduces memory usage if there's a lot of padding/nodata
+        mask = targs_flat != ignore_index
+        
+        if mask.sum() > 0:
+            valid_probs_list.append(probs_flat[mask].numpy())
+            valid_targs_list.append(targs_flat[mask].numpy())
+        
+        # Optional: Print progress for large sets
+        if batch_idx % 20 == 0 and batch_idx > 0:
+            print(f"Processed {batch_idx}/{len(preds_batches)} batches...")
+
+    if not valid_probs_list:
+        print(f"Warning: No valid pixels found (all matched ignore_index={ignore_index}). Metrics cannot be computed.")
+        return
+
+    # Concatenate all valid pixels from all batches
+    print("Concatenating results...")
+    valid_probs = np.concatenate(valid_probs_list)
+    valid_targs = np.concatenate(valid_targs_list)
     
-    # 1. Prepare for Confusion Matrix (Hard predictions)
-    hard_preds = preds_tensor.argmax(dim=1).flatten()
-    flat_targs = targs_tensor.flatten()
-    
-    # Filter out ignore_index
-    mask = flat_targs != ignore_index
-    valid_preds = hard_preds[mask].numpy()
-    valid_targs = flat_targs[mask].numpy()
-    
+    # Argmax for confusion matrix
+    valid_preds = valid_probs.argmax(axis=1)
+     
     # --- Confusion Matrix ---
     print(f"Computing Confusion Matrix for {dataset_name}...")
     cm = confusion_matrix(valid_targs, valid_preds, labels=range(len(class_names)))
@@ -70,20 +199,11 @@ def compute_and_plot_metrics(learner, dl, dataset_name, save_dir, class_names=No
     
     # --- Precision-Recall Curves ---
     print(f"Computing PR Curves for {dataset_name}...")
-    # For PR curves, we need probabilities per class.
-    # We already have probs_tensor: [N, C, H, W]
-    # We need to index the probabilities by class.
     
     plt.figure(figsize=(10, 8))
     
-    # Use the same mask to filter probabilities
-    # We need to permute probs to [N*H*W, C] to apply the 1D mask
-    num_classes = len(class_names)
-    probs_flat = probs_tensor.permute(0, 2, 3, 1).reshape(-1, num_classes)
-    
-    # Filter using the mask derived from targets
-    valid_probs = probs_flat[mask].numpy()
-    # valid_targs is already numpy and filtered
+    # valid_probs is already [N_valid_pixels, num_classes]
+    # valid_targs is [N_valid_pixels]
     
     for i, class_name in enumerate(class_names):
         # Create binary target for this class
@@ -108,4 +228,3 @@ def compute_and_plot_metrics(learner, dl, dataset_name, save_dir, class_names=No
     plt.close()
     
     print(f"Metrics saved to {save_dir}")
-
