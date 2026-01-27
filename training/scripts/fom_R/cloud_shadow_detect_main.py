@@ -16,6 +16,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from thirdparty.NIRGAN.create_NIR import get_NIR
 from rgb_nir_handler import RGBNIRHandler, prepare_rgb_with_synthetic_nir
 import math
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 class OmniCloudShadowDetector:
     """
     A class to detect clouds and shadows in RGB images using OmniCloudMask.
@@ -25,9 +31,9 @@ class OmniCloudShadowDetector:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(exist_ok=True)
-        print(f"Using device: {self.device}")
-        print(f"OmniCloudMask version: {omnicloudmask.__version__}")
-        print(f"Output will be saved to: {self.output_folder.resolve()}")
+        logger.info(f"Using device: {self.device}")
+        logger.info(f"OmniCloudMask version: {omnicloudmask.__version__}")
+        logger.info(f"Output will be saved to: {self.output_folder.resolve()}")
 
     def prepare_input_array(self, rgb_array: np.ndarray, scale_factor: int = 2, to_size = (160, 220)) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -37,7 +43,7 @@ class OmniCloudShadowDetector:
         - Scales Red, Green and NIR bands.
         """
         if rgb_array.shape[2] == 4:  # RGBA
-            print("4-channel image detected, dropping alpha channel.")
+            logger.warning("4-channel image detected, dropping alpha channel.")
             rgb_array = rgb_array[:, :, :3]
         
         if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -65,7 +71,7 @@ class OmniCloudShadowDetector:
         rgb_for_nir_gan = rgb_tensor_resized.permute(1, 2, 0).cpu().numpy()
         
         # Generate synthetic NIR
-        print("Generating synthetic NIR band...")
+        logger.debug("Generating synthetic NIR band...")
         nir = get_NIR(rgb_for_nir_gan, device=self.device)
         nir = torch.tensor(nir, dtype=torch.float32, device=self.device)
         if nir.ndim == 2:
@@ -174,7 +180,7 @@ class OmniCloudShadowDetector:
         - Result is saved at Default resolution (480x520).
         """
         image_path = Path(image_path)
-        print(f"\nProcessing: {image_path.name}")
+        logger.info(f"Processing: {image_path.name}")
 
         with rio.open(image_path) as src:
             # Read image as HWC
@@ -194,24 +200,24 @@ class OmniCloudShadowDetector:
         rgn_input_small, _ = self.prepare_input_array(rgb_array, scale_factor=3, to_size=RES_SMALL)
         
 
-        print("Running dual-resolution cloud and shadow detection...")
-        print(f"  Resolution Default: {RES_DEFAULT}")
-        print(f"  Resolution Small: {RES_SMALL}")
+        logger.info("Running dual-resolution cloud and shadow detection...")
+        logger.debug(f"  Resolution Default: {RES_DEFAULT}")
+        logger.debug(f"  Resolution Small: {RES_SMALL}")
         
         # --- Small Resolution Processing ---
-        print(f"  Processing small resolution {RES_SMALL}...")
+        logger.debug(f"  Processing small resolution {RES_SMALL}...")
         mask_conf_small = predict_from_array(rgn_input_small, export_confidence=True)
         shadow_mask_small, _, _ = self.mask_shadow_confidence(mask_conf_small, conf_thresh=0.1)
         cloud_mask_small, _, _ = self.mask_cloud_confidence(mask_conf_small, conf_thresh=0.1)
         
         # --- Default Resolution Processing ---
-        print(f"  Processing default resolution {RES_DEFAULT}...")
+        logger.debug(f"  Processing default resolution {RES_DEFAULT}...")
         mask_conf_def = predict_from_array(rgb_input_def, export_confidence=True)
         shadow_mask_def, _, _ = self.mask_shadow_confidence(mask_conf_def, conf_thresh=0.1)
         cloud_mask_def, _, _ = self.mask_cloud_confidence(mask_conf_def, conf_thresh=0.1)
 
         # --- Upscale Small Masks to Default Resolution ---
-        print("  Upscaling small masks and merging...")
+        logger.debug("  Upscaling small masks and merging...")
         
         # Resize using Nearest Neighbor to preserve class values (0, 1, 3)
         # cv2.resize expects (width, height)
@@ -235,8 +241,8 @@ class OmniCloudShadowDetector:
         # Apply Clouds (value 1) - Overwrites shadows if they overlap
         final_mask[final_cloud == 1] = 1
 
-        print(f"  Using default resolution {RES_DEFAULT} for visualization")
-        print("Detection complete. Saving visualization...")
+        logger.debug(f"  Using default resolution {RES_DEFAULT} for visualization")
+        logger.info("Detection complete. Saving visualization...")
         
         # Use the default resolution RGB for visualization
         self.save_visualization(rgb_resized_def, final_mask, image_path)
@@ -259,7 +265,7 @@ class OmniCloudShadowDetector:
         
         # Resize mask if dimensions don't match RGB
         if (mask_h != rgb_h) or (mask_w != rgb_w):
-            print(f"  Resizing mask from {mask_h}x{mask_w} to match RGB {rgb_h}x{rgb_w}")
+            logger.debug(f"  Resizing mask from {mask_h}x{mask_w} to match RGB {rgb_h}x{rgb_w}")
             mask = cv2.resize(mask.astype(np.uint8), (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
         
         fig, ax = plt.subplots(1, 3, figsize=(18, 6))
@@ -298,7 +304,7 @@ class OmniCloudShadowDetector:
         
         plt.savefig(output_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
-        print(f"Visualization saved to: {output_path}")
+        logger.info(f"Visualization saved to: {output_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
@@ -308,8 +314,8 @@ if __name__ == "__main__":
         img_dir = r"D:\Projects\QI47\2025_Projects\Image_QC\1_Data\Kavel10Data\testjanuary\dataset3\certiflAI_detected_clouds"
     
     if not os.path.exists(img_dir):
-        print(f"Error: The path does not exist: {img_dir}")
-        print("Please ensure the network path is accessible or provide a local file path as an argument.")
+        logger.error(f"Error: The path does not exist: {img_dir}")
+        logger.error("Please ensure the network path is accessible or provide a local file path as an argument.")
         sys.exit(1)
 
     output_dir = r"D:\Projects\QI47\2025_Projects\Image_QC\1_Data\Kavel10Data\testjanuary\dataset3\hitaicl21_v1.7"

@@ -10,9 +10,14 @@ import os
 import torch
 import warnings
 import cv2
+import logging
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- PATH SETUP ---
 # Add training/scripts to path to allow imports of helper modules
@@ -33,19 +38,19 @@ if str(scripts_dir) not in sys.path:
 try:
     from thirdparty.NIRGAN.create_NIR import get_NIR
     from fom_R.rgb_nir_handler import RGBNIRHandler
-    print("Successfully imported NIRGAN and RGBNIRHandler.")
+    logger.info("Successfully imported NIRGAN and RGBNIRHandler.")
 except ImportError as e:
-    print(f"Error importing required modules: {e}")
-    print(f"sys.path: {sys.path}")
-    print("Attempting to add subdirectories to path...")
+    logger.warning(f"Error importing required modules: {e}")
+    logger.warning(f"sys.path: {sys.path}")
+    logger.info("Attempting to add subdirectories to path...")
     # Fallback: add thirdparty explicitly
     sys.path.append(str(scripts_dir / "thirdparty"))
     try:
         from NIRGAN.create_NIR import get_NIR
         from fom_R.rgb_nir_handler import RGBNIRHandler
-        print("Successfully imported NIRGAN (fallback).")
+        logger.info("Successfully imported NIRGAN (fallback).")
     except ImportError as e2:
-        print(f"Critical Import Error: {e2}")
+        logger.critical(f"Critical Import Error: {e2}")
         sys.exit(1)
 
 # --- CONFIGURATION ---
@@ -61,7 +66,7 @@ try:
     INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR
     OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
 except ImportError:
-    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
     sys.exit(1)
 
 TARGET_GSD_M = 10.0  # Target resolution in meters (Match Sentinel-2 approx)
@@ -77,8 +82,8 @@ USE_METHOD_B_PREPROCESSING = False
 def preprocess_images():
     # Setup Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    print(f"Preprocessing Method: {'Clamp & Scale (Method B)' if USE_METHOD_B_PREPROCESSING else 'RGBNIRHandler (Method A)'}")
+    logger.info(f"Using device: {device}")
+    logger.info(f"Preprocessing Method: {'Clamp & Scale (Method B)' if USE_METHOD_B_PREPROCESSING else 'RGBNIRHandler (Method A)'}")
 
     # Initialize Handler (only needed for Method A)
     handler = RGBNIRHandler(device=device) if not USE_METHOD_B_PREPROCESSING else None
@@ -89,18 +94,18 @@ def preprocess_images():
 
     # Calculate scale factor (e.g. 0.05 / 10 = 0.005)
     scale_factor = SOURCE_GSD_M / TARGET_GSD_M
-    print(f"Downsampling scale factor: {scale_factor} (Source: {SOURCE_GSD_M}m -> Target: {TARGET_GSD_M}m)")
+    logger.info(f"Downsampling scale factor: {scale_factor} (Source: {SOURCE_GSD_M}m -> Target: {TARGET_GSD_M}m)")
 
     # Find all images
     image_files = list(INPUT_IMAGES_DIR.glob("*.tif"))
-    print(f"Found {len(image_files)} images to process.")
+    logger.info(f"Found {len(image_files)} images to process.")
 
     for img_path in tqdm(image_files):
         # Look for label in label dir with same name
         label_path = INPUT_LABELS_DIR / img_path.name
         
         if not label_path.exists():
-            print(f"Skipping {img_path.name}, label not found in {INPUT_LABELS_DIR}")
+            logger.warning(f"Skipping {img_path.name}, label not found in {INPUT_LABELS_DIR}")
             continue
 
         try:
@@ -111,14 +116,14 @@ def preprocess_images():
                 
                 # Check for minimum dimensions
                 if new_height < 1 or new_width < 1:
-                    print(f"Skipping {img_path.name}: Downsampled size too small ({new_width}x{new_height})")
+                    logger.warning(f"Skipping {img_path.name}: Downsampled size too small ({new_width}x{new_height})")
                     continue
 
                 # 2. Read and Resample (Downsample) entire image to memory
                 # Read RGB (3 bands)
                 count = min(3, src_img.count)
                 if count < 3:
-                    print(f"Skipping {img_path.name}: Not enough bands ({count})")
+                    logger.warning(f"Skipping {img_path.name}: Not enough bands ({count})")
                     continue
                     
                 data_img_rgb = src_img.read(
@@ -275,7 +280,7 @@ def preprocess_images():
                             dst.write(tile_lbl)
                             
         except Exception as e:
-            print(f"Failed to process {img_path.name}: {e}")
+            logger.error(f"Failed to process {img_path.name}: {e}")
             import traceback
             traceback.print_exc()
 

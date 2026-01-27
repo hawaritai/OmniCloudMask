@@ -33,3 +33,4 @@ models/
 *.pyc
 validation dataset/Throughput/speed test scenes/*
 training/scripts/local_config.py
+*.iiq

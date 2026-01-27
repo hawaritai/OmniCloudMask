@@ -6,8 +6,13 @@ import json
 import numpy as np
 import random
 import cv2
+import logging
 from collections import defaultdict
 from functools import partial
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- SETUP PATHS FOR IMPORTS ---
 # Get the current script directory (training/scripts)
@@ -52,13 +57,13 @@ try:
     from helpers import plot_batch, show_histo, print_system_info
     from eval_utils import compute_and_plot_metrics
 except ImportError as e:
-    print(f"Error importing local modules: {e}")
-    print(f"sys.path: {sys.path}")
+    logger.error(f"Error importing local modules: {e}")
+    logger.debug(f"sys.path: {sys.path}")
     sys.exit(1)
 
 def main():
-    print("Starting training script...")
-    print_system_info()
+    logger.info("Starting training script...")
+    # print_system_info() # Assuming this prints to stdout, keep as is or modify helper if possible.
 
     warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
@@ -72,9 +77,16 @@ def main():
             CUSTOM_MODEL_VERSION,
             USE_DUAL_RES_METHOD
         )
+        # Try to import BAND_ORDER, default to [1, 2, 3] if not present
+        from local_config import BAND_ORDER
     except ImportError:
-        print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
-        sys.exit(1)
+        # Check if basic config exists, if not exit
+        try:
+             from local_config import TRAIN_DATA_DIR
+             BAND_ORDER = [1, 2, 3] # Default
+        except ImportError:
+            logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+            sys.exit(1)
 
     # --- PATHS ---
     base_data_path = TRAIN_DATA_DIR
@@ -96,7 +108,10 @@ def main():
     original_image_size = 509
     max_clip_image_clip_size = 400
     min_clip_image_size = 256
-    limited_band_read_list = [1, 2, 3]  # Red Green NIR
+    
+    # Use configurable band order
+    limited_band_read_list = BAND_ORDER 
+    logger.info(f"Training using bands: {limited_band_read_list}")
     
     # Scale bands according to method:
     # Dual Res method uses [Red*3, Green*2, NIR*1] scaling instead of Z-score
@@ -118,10 +133,10 @@ def main():
     
     dataset_dirs = list(label_weights.keys())
     
-    print("Checking dataset directories...")
+    logger.info("Checking dataset directories...")
     for dataset_dir in dataset_dirs:
         if not dataset_dir.exists():
-            print(f"Warning: Directory {dataset_dir} does not exist. Please check paths.")
+            logger.warning(f"Warning: Directory {dataset_dir} does not exist. Please check paths.")
 
     if demo_mode:
         freeze_epochs = 5
@@ -129,15 +144,15 @@ def main():
         limit_training_images = 3000
     else:
         # Default for custom fine-tuning: Conservative epoch count to prevent catastrophic forgetting
-        freeze_epochs = 6
-        unfrozen_epochs = 12
+        freeze_epochs = 0
+        unfrozen_epochs = 1
         limit_training_images = None
 
     num_input_channels = len(limited_band_read_list)
-    print(f"Number of input channels: {num_input_channels}")
+    logger.info(f"Number of input channels: {num_input_channels}")
 
     # --- MODEL SETUP ---
-    print(f"Creating model: {model_type}")
+    logger.info(f"Creating model: {model_type}")
     timm_model = partial(
         timm.create_model,
         model_type,
@@ -157,7 +172,7 @@ def main():
     pretrained_weights_path = TRAIN_PRETRAINED_WEIGHTS_PATH
     
     if pretrained_weights_path.exists():
-        print(f"Loading pretrained weights from {pretrained_weights_path}")
+        logger.info(f"Loading pretrained weights from {pretrained_weights_path}")
         try:
             # Load safetensors file
             state_dict = load_file(pretrained_weights_path)
@@ -166,13 +181,13 @@ def main():
             # strict=False is often useful if there are minor mismatches (e.g. head size), 
             # though here we expect a match if it's the same model architecture.
             model.load_state_dict(state_dict, strict=False)
-            print("Successfully loaded pretrained weights.")
+            logger.info("Successfully loaded pretrained weights.")
         except Exception as e:
-            print(f"Error loading pretrained weights: {e}")
-            print("Continuing with ImageNet weights (from timm)...")
+            logger.error(f"Error loading pretrained weights: {e}")
+            logger.info("Continuing with ImageNet weights (from timm)...")
     else:
-        print(f"Warning: Pretrained weights not found at {pretrained_weights_path}")
-        print("Continuing with ImageNet weights (from timm)...")
+        logger.warning(f"Warning: Pretrained weights not found at {pretrained_weights_path}")
+        logger.info("Continuing with ImageNet weights (from timm)...")
 
     # Dummy Input Check
     dummy_input = torch.randn(
@@ -197,14 +212,14 @@ def main():
     config_path = pytorch_model_path.parent / f"{pytorch_model_path.stem}_config.json"
 
     if pytorch_model_path.exists():
-        print(f"Warning: Model {pytorch_model_name} already exists.")
+        logger.warning(f"Warning: Model {pytorch_model_name} already exists.")
 
-    print(f"Fastai model name: {fai_model_name}")
-    print(f"PyTorch model path: {pytorch_model_path}")
+    logger.info(f"Fastai model name: {fai_model_name}")
+    logger.info(f"PyTorch model path: {pytorch_model_path}")
 
     # --- DATA LOADING ---
     validation_dataset_files = set(cloudsen12_validation_dir.glob("*image*.tif"))
-    print(f"Validation images found: {len(validation_dataset_files)}")
+    logger.info(f"Validation images found: {len(validation_dataset_files)}")
 
     def multi_dataset_getter(paths: list[Path], print_counts: bool = False):
         training_images = []
@@ -214,26 +229,26 @@ def main():
                 v_imgs = list(path.glob("*image*.tif"))
                 validation_images = v_imgs
                 if print_counts:
-                    print(f"{path.name} found {len(v_imgs)} validation images")
+                    logger.debug(f"{path.name} found {len(v_imgs)} validation images")
             else:
                 images = list(path.glob("*image*.tif"))
                 if print_counts:
-                    print(f"{path.name} found {len(images)} images")
+                    logger.debug(f"{path.name} found {len(images)} images")
                 training_images.extend(images)
         
         if print_counts:
-            print(f"Found {len(training_images)} training images")
+            logger.info(f"Found {len(training_images)} training images")
 
         if limit_training_images:
             training_images = np.random.choice(
                 training_images, limit_training_images, replace=False
             ).tolist()
             if print_counts:
-                print(f"Limited training images to {len(training_images)}")
+                logger.info(f"Limited training images to {len(training_images)}")
 
         datasets = training_images + validation_images
         if print_counts:
-            print(f"Combined training and validation {len(datasets)} images")
+            logger.info(f"Combined training and validation {len(datasets)} images")
         return datasets
 
     train_and_val_images = multi_dataset_getter(list(dataset_dirs), print_counts=True)
@@ -339,7 +354,7 @@ def main():
     ]
 
     # --- DATALOADER ---
-    print("Creating DataBlock...")
+    logger.info("Creating DataBlock...")
     dblock = DataBlock(
         blocks=[
             TransformBlock([open_image_func]),
@@ -356,7 +371,7 @@ def main():
         ],
     )
 
-    print("Creating DataLoaders...")
+    logger.info("Creating DataLoaders...")
     num_workers = 0 if os.name == 'nt' else 6
     
     dl = dblock.dataloaders(
@@ -367,12 +382,12 @@ def main():
     )
 
     try:
-        print("Fetching one batch...")
+        logger.info("Fetching one batch...")
         batch = dl.one_batch()
-        print(f"Input shape: {batch[0].shape}")
-        print(f"Label shape: {batch[1].shape}")
+        logger.debug(f"Input shape: {batch[0].shape}")
+        logger.debug(f"Label shape: {batch[1].shape}")
     except Exception as e:
-        print(f"Error fetching batch: {e}")
+        logger.error(f"Error fetching batch: {e}")
         return
 
     # --- TRAINING ---
@@ -380,7 +395,7 @@ def main():
         GradientAccumulation(gradient_accumulation_batch_size),
     ]
 
-    print("Initializing Learner...")
+    logger.info("Initializing Learner...")
     learner = Learner(
         dls=dl,
         model=model,
@@ -392,7 +407,7 @@ def main():
     if use_bf16:
         learner = learner.to_bf16()
 
-    print(f"Starting Fine Tuning: Freeze {freeze_epochs}, Unfreeze {unfrozen_epochs}")
+    logger.info(f"Starting Fine Tuning: Freeze {freeze_epochs}, Unfreeze {unfrozen_epochs}")
     learner.fine_tune(
         epochs=unfrozen_epochs,
         freeze_epochs=freeze_epochs,
@@ -400,7 +415,7 @@ def main():
     )
 
     # --- SAVING ---
-    print("Saving models...")
+    logger.info("Saving models...")
     learner.save(fai_model_name)
     
     model_cpu = learner.model.to("cpu").float()
@@ -428,10 +443,10 @@ def main():
     with open(config_path, "w") as f:
         json.dump(config, f, indent=4)
         
-    print(f"Training complete. Models saved to {models_dir}")
+    logger.info(f"Training complete. Models saved to {models_dir}")
 
     # --- EVALUATION ---
-    print("\n--- Starting Evaluation ---")
+    logger.info("\n--- Starting Evaluation ---")
     results_dir = models_dir / f"results_{model_version}"
     
     # Validation Set
@@ -444,7 +459,7 @@ def main():
             class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
         )
     except Exception as e:
-        print(f"Error evaluating validation set: {e}")
+        logger.error(f"Error evaluating validation set: {e}")
 
     # Training Set
     try:
@@ -456,7 +471,7 @@ def main():
             class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
         )
     except Exception as e:
-        print(f"Error evaluating training set: {e}")
+        logger.error(f"Error evaluating training set: {e}")
 
 if __name__ == "__main__":
     main()

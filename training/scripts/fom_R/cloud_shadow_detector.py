@@ -12,13 +12,12 @@ from omnicloudmask import predict_from_array
 import omnicloudmask
 import cv2
 import math
+import logging
 
-# Add parent directory to path to import from thirdparty
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from thirdparty.NIRGAN.create_NIR import get_NIR
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Import RGB+NIR handler
-from rgb_nir_handler import RGBNIRHandler, prepare_rgb_with_synthetic_nir
 class OmniCloudShadowDetector:
     """
     A class to detect clouds and shadows in RGB images using OmniCloudMask.
@@ -28,9 +27,9 @@ class OmniCloudShadowDetector:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(exist_ok=True)
-        print(f"Using device: {self.device}")
-        print(f"OmniCloudMask version: {omnicloudmask.__version__}")
-        print(f"Output will be saved to: {self.output_folder.resolve()}")
+        logger.info(f"Using device: {self.device}")
+        logger.info(f"OmniCloudMask version: {omnicloudmask.__version__}")
+        logger.info(f"Output will be saved to: {self.output_folder.resolve()}")
 
 
 
@@ -168,16 +167,16 @@ class OmniCloudShadowDetector:
         """
         # ===== STEP 1: Validate and prepare RGB =====
         if rgb_array.shape[2] == 4:  # RGBA
-            print("⚠️  4-channel image detected, dropping alpha channel.")
+            logger.warning("⚠️  4-channel image detected, dropping alpha channel.")
             rgb_array = rgb_array[:, :, :3]
         
         if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
             raise ValueError(f"Input must be RGB image (H, W, 3), got {rgb_array.shape}")
         
-        print(f"Original RGB shape: {rgb_array.shape}")
+        logger.debug(f"Original RGB shape: {rgb_array.shape}")
         
         # ===== STEP 1b: Enhance for shadow detection =====
-        print("🔄 Enhancing image for shadow detection...")
+        logger.debug("🔄 Enhancing image for shadow detection...")
         rgb_array = self.enhance_for_shadow_detection(rgb_array)
         
         # ===== STEP 2: Resize RGB for processing =====
@@ -213,7 +212,7 @@ class OmniCloudShadowDetector:
         rgb_for_nir_gan = rgb_tensor_resized.permute(1, 2, 0).cpu().numpy()
         
         # ===== STEP 3: Generate synthetic NIR =====
-        print("🔄 Generating synthetic NIR band from NIRGAN...")
+        logger.debug("🔄 Generating synthetic NIR band from NIRGAN...")
         nir_synthetic = get_NIR(rgb_for_nir_gan, device=self.device)
         
         # Ensure NIR is 2D (H, W)
@@ -222,7 +221,7 @@ class OmniCloudShadowDetector:
         elif nir_synthetic.ndim == 3:
             nir_synthetic = nir_synthetic.squeeze()
         
-        print(f"Generated NIR shape: {nir_synthetic.shape}")
+        logger.debug(f"Generated NIR shape: {nir_synthetic.shape}")
         
         # ===== STEP 4: Stack RGB + Synthetic NIR =====
         # Extract individual RGB channels (already in CHW format)
@@ -246,12 +245,12 @@ class OmniCloudShadowDetector:
         # ===== STEP 5: Validate result =====
         if validate_nir:
             nir_quality = handler.validate_nir_quality(nir_synthetic)
-            print(f"✓ NIR Quality: {nir_quality['info']}")
-            print(f"  Mean: {nir_quality['mean']:.4f}, Std: {nir_quality['std']:.4f}")
+            logger.info(f"✓ NIR Quality: {nir_quality['info']}")
+            logger.debug(f"  Mean: {nir_quality['mean']:.4f}, Std: {nir_quality['std']:.4f}")
         
-        print(f"✓ Final RG+NIR stack shape: {rgn_stack.shape}")
-        print(f"  Band order: [RED(0), GREEN(1), NIR(2)]")
-        print(f"  Value range: [{rgn_stack.min():.4f}, {rgn_stack.max():.4f}]")
+        logger.debug(f"✓ Final RG+NIR stack shape: {rgn_stack.shape}")
+        logger.debug(f"  Band order: [RED(0), GREEN(1), NIR(2)]")
+        logger.debug(f"  Value range: [{rgn_stack.min():.4f}, {rgn_stack.max():.4f}]")
         
         return rgn_stack, rgb_tensor_resized.cpu().numpy()
     
@@ -332,7 +331,7 @@ class OmniCloudShadowDetector:
         Loads an image, detects clouds and shadows, and saves the result.
         """
         image_path = Path(image_path)
-        print(f"Processing: {image_path.name}")
+        logger.info(f"Processing: {image_path.name}")
         
         with rio.open(image_path) as src:
             # Read image as HWC
@@ -346,7 +345,7 @@ class OmniCloudShadowDetector:
             validate_nir=True
         )
 
-        print("Running cloud and shadow detection...")
+        logger.info("Running cloud and shadow detection...")
         # predict_from_array expects (bands, height, width)
         mask = predict_from_array(rgn_input)
         mask_2d = mask[0]  # The actual mask is the first item
@@ -366,12 +365,12 @@ class OmniCloudShadowDetector:
         shadow_pixels = np.sum(shadow_mask)
         cloud_pct = (cloud_pixels / total_pixels) * 100
         shadow_pct = (shadow_pixels / total_pixels) * 100
-        print(f"  Cloud pixels: {cloud_pixels:,} ({cloud_pct:.2f}%)")
-        print(f"  Shadow pixels: {shadow_pixels:,} ({shadow_pct:.2f}%)")
-        print(f"  Cloud confidence: {cloud_conf:.3f}")
-        print(f"  Shadow confidence: {shadow_conf:.3f}")
+        logger.info(f"  Cloud pixels: {cloud_pixels:,} ({cloud_pct:.2f}%)")
+        logger.info(f"  Shadow pixels: {shadow_pixels:,} ({shadow_pct:.2f}%)")
+        logger.debug(f"  Cloud confidence: {cloud_conf:.3f}")
+        logger.debug(f"  Shadow confidence: {shadow_conf:.3f}")
 
-        print("Detection complete. Saving visualization...")
+        logger.info("Detection complete. Saving visualization...")
         self.save_visualization(original_rgb_resized, mask_2d, image_path)
 
         return mask_final
@@ -418,7 +417,7 @@ class OmniCloudShadowDetector:
         
         plt.savefig(output_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
-        print(f"Visualization saved to: {output_path}")
+        logger.info(f"Visualization saved to: {output_path}")
 
 
 if __name__ == "__main__":
@@ -429,8 +428,8 @@ if __name__ == "__main__":
         img_dir = r"D:\Projects\QI47\2025_Projects\Image_QC\1_Data\Kavel10Data\testjanuary\dataset3\certiflAI_detected_shadows"
     
     if not os.path.exists(img_dir):
-        print(f"Error: The path does not exist: {img_dir}")
-        print("Please ensure the network path is accessible or provide a local file path as an argument.")
+        logger.error(f"Error: The path does not exist: {img_dir}")
+        logger.error("Please ensure the network path is accessible or provide a local file path as an argument.")
         sys.exit(1)
 
     output_dir = r"D:\Projects\QI47\2025_Projects\Image_QC\1_Data\Kavel10Data\testjanuary\dataset3\hitaish10"

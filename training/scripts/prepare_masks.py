@@ -10,9 +10,14 @@ from shapely.affinity import scale, translate
 from pathlib import Path
 from tqdm import tqdm
 import warnings
+import logging
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 # Default CRS for the project (France)
@@ -28,7 +33,7 @@ try:
     GPKG_DIR = PREPARE_MASKS_GPKG_DIR
     OUTPUT_DIR = PREPARE_MASKS_OUTPUT_DIR
 except ImportError:
-    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    logger.error("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
     # Fallback to prevent immediate crash if user is just reading code, but will likely fail later
     IMAGE_DIR = Path("DATA_DIR_NOT_SET/images")
     GPKG_DIR = Path("DATA_DIR_NOT_SET/gpkg")
@@ -44,13 +49,13 @@ CLASS_MAPPING = {
 
 def process_masks():
     if not IMAGE_DIR.exists():
-        print(f"Error: Image directory not found: {IMAGE_DIR}")
+        logger.error(f"Error: Image directory not found: {IMAGE_DIR}")
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     image_files = list(IMAGE_DIR.glob("*.tif"))
-    print(f"Found {len(image_files)} images.")
+    logger.info(f"Found {len(image_files)} images.")
 
     for img_path in tqdm(image_files):
         try:
@@ -83,7 +88,7 @@ def process_masks():
                 gdf = gpd.read_file(gpkg_path)
                 
                 if 'Remark' not in gdf.columns:
-                    print(f"Warning: 'Remark' column missing in {gpkg_path.name}. Generating black mask.")
+                    logger.warning(f"Warning: 'Remark' column missing in {gpkg_path.name}. Generating black mask.")
                 else:
                     # 3. Coordinate Transformation Logic
                     if is_georeferenced:
@@ -152,7 +157,7 @@ def process_masks():
                 dst.write(mask, 1)
 
         except Exception as e:
-            print(f"Failed to process {img_path.name}: {e}")
+            logger.error(f"Failed to process {img_path.name}: {e}")
 
 if __name__ == "__main__":
     process_masks()

@@ -13,6 +13,9 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class RGBNIRHandler:
@@ -263,15 +266,15 @@ def prepare_rgb_with_synthetic_nir(
     
     # Validate shapes match
     if red.shape != nir_array.shape:
-        print(f"Warning: RGB shape {red.shape} != NIR shape {nir_array.shape}")
-        print("Attempting to resize NIR to match RGB...")
+        logger.warning(f"Warning: RGB shape {red.shape} != NIR shape {nir_array.shape}")
+        logger.warning("Attempting to resize NIR to match RGB...")
         nir_array = cv2.resize(nir_array, (red.shape[1], red.shape[0]))
     
     # Validate NIR quality
     if validate:
         nir_quality = handler.validate_nir_quality(nir_array)
-        print(f"NIR Quality: {nir_quality['info']}")
-        print(f"  Mean: {nir_quality['mean']:.4f}, Std: {nir_quality['std']:.4f}")
+        logger.info(f"NIR Quality: {nir_quality['info']}")
+        logger.debug(f"  Mean: {nir_quality['mean']:.4f}, Std: {nir_quality['std']:.4f}")
     
     # Stack bands - IMPORTANT: RED, GREEN, NIR order
     rgn_stack = handler.stack_rgb_nir(
