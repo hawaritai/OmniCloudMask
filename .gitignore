@@ -153,6 +153,8 @@ htmlcov/
 coverage.xml
 *.cover
 .hypothesis/
+model_comparison_results_*/
+test_results*/
 
 # ===================================
 # Logs
