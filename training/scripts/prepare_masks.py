@@ -1,4 +1,4 @@
-
+import re
 import os
 import glob
 import numpy as np
@@ -7,6 +7,7 @@ from rasterio.features import rasterize
 from rasterio.transform import from_origin
 import geopandas as gpd
 from shapely.affinity import scale, translate
+from shapely.geometry import box
 from pathlib import Path
 from tqdm import tqdm
 import warnings
@@ -111,13 +112,21 @@ def process_masks():
                             return scale(geom, xfact=1.0, yfact=-1.0, origin=(0,0))
                         
                         # If coordinates look like they are flipped (negative Y), flip them back
-                        if max_y <= 0:
-                            gdf['geometry'] = gdf['geometry'].apply(flip_y)
+                        # if max_y <= 0:
+                        gdf['geometry'] = gdf['geometry'].apply(flip_y)
                     
                     # Filter and Rasterize
                     shapes_to_burn = []
+
                     for idx, row in gdf.iterrows():
-                        cls_name = row['Remark']
+                        raw_cls = row['Remark']
+
+                        if isinstance(raw_cls, str):
+                            # remove leading/trailing spaces + collapse multiple spaces
+                            cls_name = re.sub(r'\s+', ' ', raw_cls.strip())
+                        else:
+                            continue
+
                         if cls_name in CLASS_MAPPING:
                             val = CLASS_MAPPING[cls_name]
                             shapes_to_burn.append((row['geometry'], val))
@@ -126,6 +135,7 @@ def process_masks():
                     shapes_to_burn.sort(key=lambda x: x[1], reverse=True) 
                     
                     if shapes_to_burn:
+                        # 1. Initial Attempt (Default)
                         rasterize(
                             shapes=shapes_to_burn,
                             out=mask,
@@ -134,6 +144,84 @@ def process_masks():
                             default_value=0,
                             dtype=np.uint8
                         )
+
+                        # CHECK: If mask is empty but shapes exist, investigate and try fallbacks
+                        if mask.max() == 0:
+                            logger.warning(f"⚠️ Mask is empty for {img_path.name} despite finding {len(shapes_to_burn)} shapes! Attempting fallbacks...")
+                            
+                            img_bounds = src.bounds
+                            shp_bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
+                            
+                            img_box = box(img_bounds.left, img_bounds.bottom, img_bounds.right, img_bounds.top)
+                            shp_box = box(shp_bounds[0], shp_bounds[1], shp_bounds[2], shp_bounds[3])
+                            
+                            logger.info(f"  Image Bounds: {img_bounds}")
+                            logger.info(f"  Shape Bounds: {shp_bounds}")
+                            logger.info(f"  Intersects: {img_box.intersects(shp_box)}")
+
+                            # Strategy 1: all_touched=True
+                            # Helps with very small polygons or lines that don't cover pixel centers
+                            logger.info("  🔄 Strategy 1: Retry with all_touched=True...")
+                            rasterize(
+                                shapes=shapes_to_burn,
+                                out=mask,
+                                transform=dst_transform,
+                                fill=0,
+                                default_value=0,
+                                dtype=np.uint8,
+                                all_touched=True
+                            )
+                            
+                            if mask.max() == 0:
+                                # Strategy 2: Y-Flip (scale y=-1)
+                                # Handles cases where Y-axis direction is inverted (e.g. Cartesian vs Image)
+                                logger.info("  🔄 Strategy 2: Y-Flip (scale y=-1)...")
+                                flipped_shapes = []
+                                for geom, val in shapes_to_burn:
+                                    f_geom = scale(geom, xfact=1.0, yfact=-1.0, origin=(0,0))
+                                    flipped_shapes.append((f_geom, val))
+                                
+                                rasterize(
+                                    shapes=flipped_shapes,
+                                    out=mask,
+                                    transform=dst_transform,
+                                    fill=0,
+                                    default_value=0,
+                                    dtype=np.uint8
+                                )
+
+                            if mask.max() == 0:
+                                # Strategy 3: Y-Flip + Translate (y = height - y)
+                                # Handles "Bottom-Left Origin" vs "Top-Left Origin" coordinate systems
+                                # Logic: y_new = height - y_old
+                                # Implementation: Scale y=-1 (around 0), then Translate y=+height
+                                if not is_georeferenced:
+                                    # This typically applies to pixel coordinates
+                                    logger.info(f"  🔄 Strategy 3: Y-Flip + Translate (y = {height} - y)...")
+                                    # Re-use flipped shapes from Strategy 2 or generate them
+                                    # We need to make sure we are flipping original shapes
+                                    
+                                    flip_translate_shapes = []
+                                    for geom, val in shapes_to_burn:
+                                        # 1. Flip Y around 0 (y -> -y)
+                                        f_geom = scale(geom, xfact=1.0, yfact=-1.0, origin=(0,0))
+                                        # 2. Translate by image height (y -> -y + height)
+                                        ft_geom = translate(f_geom, xoff=0.0, yoff=float(height))
+                                        flip_translate_shapes.append((ft_geom, val))
+                                        
+                                    rasterize(
+                                        shapes=flip_translate_shapes,
+                                        out=mask,
+                                        transform=dst_transform,
+                                        fill=0,
+                                        default_value=0,
+                                        dtype=np.uint8
+                                    )
+
+                            if mask.max() > 0:
+                                logger.info(f"  ✅ Fallback successful! Mask generated.")
+                            else:
+                                logger.error(f"  ❌ All fallbacks failed. Mask remains empty.")
             else:
                 # GPKG not found, mask remains all zeros (full black)
                 pass
