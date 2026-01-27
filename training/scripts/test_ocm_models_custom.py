@@ -10,12 +10,20 @@ from functools import partial
 import timm
 from fastai.vision.all import create_unet_model
 from safetensors.torch import load_file
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import warnings
+import logging
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- SETUP PATHS ---
 current_script_dir = Path(__file__).parent.resolve()
@@ -36,15 +44,15 @@ try:
     # Assuming NIRGAN is in training/scripts/thirdparty/NIRGAN
     from thirdparty.NIRGAN.create_NIR import get_NIR
 except ImportError as e:
-    print(f"Import Error: {e}")
-    print(f"sys.path: {sys.path}")
+    logger.warning(f"Import Error: {e}")
+    logger.debug(f"sys.path: {sys.path}")
     # Try alternate path for NIRGAN if running from different context
     try:
         sys.path.append(str(current_script_dir / "thirdparty"))
         from NIRGAN.create_NIR import get_NIR
         from omnicloudmask.cloud_mask import predict_from_array
     except ImportError as e2:
-        print(f"Critical Import Error: {e2}")
+        logger.critical(f"Critical Import Error: {e2}")
         sys.exit(1)
 
 # --- LOCAL CONFIG IMPORT ---
@@ -58,15 +66,28 @@ try:
         USE_DUAL_RES_METHOD as CFG_USE_DUAL_RES_METHOD
     )
 except ImportError:
-    print("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
     sys.exit(1)
 
 # --- CONFIGURATION ---
-MODEL_TYPE = "regnety_004.pycls_in1k"
+# Defaults (can be overridden by local_config)
+MODEL_TYPE = getattr(sys.modules.get('local_config'), 'MODEL_TYPE', "regnety_004.pycls_in1k")
 NUM_CHANNELS = 3  # R, G, NIR
 MODEL_PATCH_SIZE = (509, 509)
-# TARGET_RESOLUTION = (480, 520) # Deprecated
-SCALE_FACTOR = 0.1 # Match the training preprocessing (1m -> 10m GSD = 0.1)
+
+# Scaling: 0.1 converts ~1m pixels to ~10m (Sentinel-2 scale)
+# Set to 1.0 if your data is already at target resolution (e.g. Sentinel-2 L2A)
+SCALE_FACTOR = getattr(sys.modules.get('local_config'), 'SCALE_FACTOR', 0.1) 
+
+# Bands to read from the input .tif
+# Common 4-band Aerial (R, G, B, NIR) -> Use [1, 2, 4] to get R, G, NIR
+# Common 3-band Aerial (R, G, NIR)    -> Use [1, 2, 3]
+# Common 3-band RGB    (R, G, B)      -> Use [1, 2, 3] AND set GENERATE_SYNTHETIC_NIR = True
+BAND_ORDER = getattr(sys.modules.get('local_config'), 'BAND_ORDER', [1, 2, 3]) 
+
+# Set True ONLY if your input is RGB and you need to fake the NIR channel
+GENERATE_SYNTHETIC_NIR = getattr(sys.modules.get('local_config'), 'GENERATE_SYNTHETIC_NIR', False)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- INFERENCE METHOD TOGGLE ---
@@ -87,11 +108,13 @@ class OCMTester:
         self.model = self._load_model(model_path)
         self.output_dir = OUTPUT_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Output directory: {self.output_dir}")
-        print(f"Inference Method: {'Dual-Res (New)' if USE_DUAL_RES_METHOD else 'Z-Score Tiled (Legacy)'}")
+        logger.info(f"Output directory: {self.output_dir}")
+        logger.info(f"Inference Method: {'Dual-Res (New)' if USE_DUAL_RES_METHOD else 'Z-Score Tiled (Legacy)'}")
+        logger.info(f"Model Type: {MODEL_TYPE}")
+        logger.info(f"Bands: {BAND_ORDER} | Scale: {SCALE_FACTOR} | Synthetic NIR: {GENERATE_SYNTHETIC_NIR}")
 
     def _load_model(self, model_path: Path):
-        print(f"Loading model from {model_path}...")
+        logger.info(f"Loading model from {model_path}...")
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
@@ -120,7 +143,7 @@ class OCMTester:
             model.load_state_dict(state_dict, strict=False)
             model.to(self.device)
             model.eval()
-            print("Model loaded successfully.")
+            logger.info("Model loaded successfully.")
             return model
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights: {e}")
@@ -255,7 +278,7 @@ class OCMTester:
         """
         Method B: Dual Resolution + Clamp Scaling
         """
-        print(f"Processing (Dual Res) {image_path.name}...")
+        # print(f"Processing (Dual Res) {image_path.name}...")
         try:
             with rio.open(image_path) as src:
                 rgb_array = np.transpose(src.read([1, 2, 3]), (1, 2, 0))
@@ -299,7 +322,7 @@ class OCMTester:
             cloud_mask_small_upscaled = cv2.resize(cloud_mask_small.astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST)
 
             final_shadow = shadow_mask_def | shadow_mask_small_upscaled
-            final_cloud = cloud_mask_def | cloud_mask_small_upscaled
+            final_cloud = cloud_mask_def #| cloud_mask_small_upscaled
             
             final_mask = np.zeros(RES_DEFAULT, dtype=np.uint8)
             final_mask[final_shadow == 3] = 3
@@ -311,69 +334,87 @@ class OCMTester:
             self.save_visualization(rgb_viz, final_mask, image_path.stem)
 
         except Exception as e:
-            print(f"Error processing {image_path.name}: {e}")
+            logger.error(f"Error processing {image_path.name}: {e}")
             import traceback
             traceback.print_exc()
 
     def process_image(self, image_path: Path):
         """
         Method A: Z-Score Tiled (Legacy)
+        
+        ADAPTED FOR CUSTOM DATA:
+        - Reads bands specified in BAND_ORDER.
+        - Supports direct NIR reading (no GAN) if available.
+        - Scales based on SCALE_FACTOR.
         """
-        print(f"Processing (Z-Score) {image_path.name}...")
+        logger.info(f"Processing (Z-Score) {image_path.name}...")
         
         try:
             with rio.open(image_path) as src:
-                # Read RGB (first 3 bands)
-                rgb = src.read([1, 2, 3])
-                if rgb.shape[0] != 3:
-                    print(f"Skipping {image_path.name}: Expected 3 bands, got {rgb.shape[0]}")
+                # Read specified bands
+                # Note: src.read expects bands to be 1-indexed
+                try:
+                    raw_bands = src.read(BAND_ORDER)
+                except Exception as e:
+                    logger.error(f"Error reading bands {BAND_ORDER} from {image_path.name}: {e}")
                     return
 
-            # Transpose to HWC for processing
-            rgb_hwc = np.transpose(rgb, (1, 2, 0))
-            h_native, w_native = rgb_hwc.shape[:2]
+                if raw_bands.shape[0] != 3:
+                    logger.warning(f"Skipping {image_path.name}: Expected 3 bands (R, G, NIR), got {raw_bands.shape[0]}")
+                    return
 
-            # --- DOWNSAMPLE to Match Training Scale ---
-            # Training used ~10m GSD (Scale 0.1 from ~1m source)
-            # We must replicate this or the model will see "zoomed in" noise
-            h_infer = int(h_native * SCALE_FACTOR)
-            w_infer = int(w_native * SCALE_FACTOR)
-            
-            # Ensure minimum size (at least 32x32 for model stability, though OCM handles padding)
-            h_infer = max(h_infer, 64)
-            w_infer = max(w_infer, 64)
+            # Transpose to HWC for resizing/processing
+            # raw_bands is (3, H, W)
+            img_hwc = np.transpose(raw_bands, (1, 2, 0))
+            h_native, w_native = img_hwc.shape[:2]
 
-            print(f"Downsampling Input: {w_native}x{h_native} -> {w_infer}x{h_infer} (Scale: {SCALE_FACTOR})")
-            rgb_infer = cv2.resize(rgb_hwc, (w_infer, h_infer), interpolation=cv2.INTER_AREA)
+            # --- DOWNSAMPLE ---
+            if SCALE_FACTOR != 1.0:
+                h_infer = int(h_native * SCALE_FACTOR)
+                w_infer = int(w_native * SCALE_FACTOR)
+                
+                # Ensure minimum size
+                h_infer = max(h_infer, 64)
+                w_infer = max(w_infer, 64)
 
-            # --- GENERATE NIR ---
-            # Prepare for GAN (requires 0-255 uint8)
-            if rgb_infer.dtype != np.uint8:
-                rgb_gan_input = ((rgb_infer - rgb_infer.min()) / (rgb_infer.max() - rgb_infer.min() + 1e-8) * 255).astype(np.uint8)
+                logger.debug(f"Resizing: {w_native}x{h_native} -> {w_infer}x{h_infer} (Scale: {SCALE_FACTOR})")
+                img_infer = cv2.resize(img_hwc, (w_infer, h_infer), interpolation=cv2.INTER_AREA)
             else:
-                rgb_gan_input = rgb_infer
-
-            print("Generating synthetic NIR...")
-            nir_infer = get_NIR(rgb_gan_input, device=self.device)
-            
-            # Ensure shape match exactly
-            if nir_infer.shape != (h_infer, w_infer):
-                 nir_infer = cv2.resize(nir_infer, (w_infer, h_infer), interpolation=cv2.INTER_LINEAR)
+                h_infer, w_infer = h_native, w_native
+                img_infer = img_hwc
 
             # --- PREPARE STACK ---
-            red = rgb_infer[:, :, 0].astype(np.float32)
-            green = rgb_infer[:, :, 1].astype(np.float32)
-            nir = nir_infer.astype(np.float32)
-            
-            rgn_stack = np.stack([red, green, nir], axis=0) # (3, H, W)
-            
+            if GENERATE_SYNTHETIC_NIR:
+                logger.debug("Generating synthetic NIR (GENERATE_SYNTHETIC_NIR=True)...")
+                # Assuming img_infer is RGB
+                # GAN requires 0-255 uint8 input
+                if img_infer.dtype != np.uint8:
+                     # Normalize to 0-255 for GAN
+                     rgb_gan = ((img_infer - img_infer.min()) / (img_infer.max() - img_infer.min() + 1e-8) * 255).astype(np.uint8)
+                else:
+                    rgb_gan = img_infer
+                
+                nir_syn = get_NIR(rgb_gan, device=self.device)
+                
+                # Ensure shape match
+                if nir_syn.shape != (h_infer, w_infer):
+                     nir_syn = cv2.resize(nir_syn, (w_infer, h_infer), interpolation=cv2.INTER_LINEAR)
+                
+                red = img_infer[:, :, 0].astype(np.float32)
+                green = img_infer[:, :, 1].astype(np.float32)
+                nir = nir_syn.astype(np.float32)
+                
+                rgn_stack = np.stack([red, green, nir], axis=0) # (3, H, W)
+            else:
+                # Assume input bands are already R, G, NIR (or whatever the model expects)
+                # Just transpose back to CHW for normalization
+                rgn_stack = np.transpose(img_infer, (2, 0, 1)).astype(np.float32)
+
             # --- NORMALIZE ---
             rgn_norm = self.z_score_normalize(rgn_stack)
             
             # --- INFERENCE ---
-            print(f"Running inference on scaled image ({w_infer}x{h_infer})...")
-            # predict_from_array will tile this scaled image if it's larger than 509x509
-            # Use export_confidence=True to get raw probabilities
+            logger.info(f"Running inference on image ({w_infer}x{h_infer})...")
             mask_conf = predict_from_array(
                 rgn_norm,
                 custom_models=[self.model],
@@ -383,36 +424,20 @@ class OCMTester:
                 export_confidence=True
             )
             
-            # --- POST-PROCESSING (Refine Clouds & Shadows) ---
-            # Shadows: Aggressive refinement with morphology & thresholds
+            # --- POST-PROCESSING ---
             shadow_mask, shadow_conf = self.mask_shadow_confidence(mask_conf, conf_thresh=-0.1)
-            
-            # Clouds: Merge classes 1 & 2
             cloud_mask, cloud_conf = self.mask_cloud_confidence(mask_conf, conf_thresh=0.0)
             
-            # Combine: 1=Cloud, 3=Shadow. If both, Cloud wins (usually) or use logic.
-            # Here we follow detector logic: mask_final = shadow_mask | cloud_mask
-            # Since shadow_mask is 0 or 3, and cloud_mask is 0 or 1.
-            # Overlap handling: Cloud usually obscures shadow, so if both exist, let's say Cloud takes precedence?
-            # Or just bitwise OR: 3 | 1 = 3 (Shadow wins visual? No 1=01, 3=11). 
-            # Actually, let's just layer them.
-            
-            mask_final_low_res = np.zeros_like(shadow_mask, dtype=np.uint8)
-            mask_final_low_res[shadow_mask == 3] = 3
-            mask_final_low_res[cloud_mask == 1] = 1 # Clouds overwrite shadows if overlap
+            mask_final = np.zeros_like(shadow_mask, dtype=np.uint8)
+            mask_final[shadow_mask == 3] = 3
+            mask_final[cloud_mask == 1] = 1 
 
-            # --- SKIP UPSAMPLING ---
-            # Save the mask at the inference resolution (0.1x)
-            print(f"Keeping Mask at Inference Resolution: {w_infer}x{h_infer}")
-            final_mask = mask_final_low_res
-            
             # --- SAVE RESULT ---
-            # We pass the original RGB and the small mask. 
-            # The visualization function will handle the size difference.
-            self.save_visualization(rgb_infer, final_mask, image_path.stem)
+            # We pass the inference image for viz
+            self.save_visualization(img_infer, mask_final, image_path.stem)
             
         except Exception as e:
-            print(f"Error processing {image_path.name}: {e}")
+            logger.error(f"Error processing {image_path.name}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -450,23 +475,23 @@ class OCMTester:
         plt.tight_layout()
         plt.savefig(out_file)
         plt.close()
-        print(f"Saved visualization to {out_file}")
+        # logger.info(f"Saved visualization to {out_file}")
 
 if __name__ == "__main__":
     if not MODEL_PATH.exists():
-        print(f"Error: Model not found at {MODEL_PATH}")
-        print("Please ensure you have run the training script or updated the path.")
+        logger.error(f"Error: Model not found at {MODEL_PATH}")
+        logger.error("Please ensure you have run the training script or updated the path.")
         sys.exit(1)
         
     tester = OCMTester(MODEL_PATH)
     
     # Process images
     # You can change the glob pattern or directory
-    images = list(TEST_IMAGES_DIR.glob("*.tif"))
+    images = list(TEST_IMAGES_DIR.glob("*.tif")) + list(TEST_IMAGES_DIR.glob("*.iiq")) + list(TEST_IMAGES_DIR.glob("*.jpg"))
     if not images:
-        print(f"No .tif images found in {TEST_IMAGES_DIR}")
+        logger.warning(f"No .tif images found in {TEST_IMAGES_DIR}")
     else:
-        print(f"Found {len(images)} images. Processing...")
+        logger.info(f"Found {len(images)} images. Processing...")
         # Process a few samples to save time, or all
         for img_path in images: # Process first 5 for testing
             if USE_DUAL_RES_METHOD:
