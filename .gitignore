@@ -140,6 +140,18 @@ models/
 # Documentation and Notebooks
 # ===================================
 training/convert models.ipynb
+custom_models/*
+*.DS_Store
+omnicloudmask/models/*.safetensors
+training/__pycache__/*
+omnicloudmask/models/*_PT_state.pth
+examples/Maxar data/*
+examples/PlanetScope data/*
+tests/speed test/speed test scenes/*
+*.pyc
+validation dataset/Throughput/speed test scenes/*
+uv.lock
+
 
 # ===================================
 # Testing and Coverage
