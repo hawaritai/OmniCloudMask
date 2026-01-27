@@ -1,36 +1,221 @@
+# ===================================
+# Python
+# ===================================
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# ===================================
+# Virtual Environments
+# ===================================
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+*.virtualenv
+
+# ===================================
+# IDEs and Editors
+# ===================================
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ===================================
+# Operating System
+# ===================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+
+# ===================================
+# Project-Specific Data Directories
+# ===================================
 maxar data/
-omnicloudmask/__pycache__
-omnicloudmask/models/*PT.pth
-test data/
+Maxar data/
+examples/Maxar data/
 Sentinel-2 data/
-build/*
-omnicloudmask.egg-info/*
-dist/*
-Maxar data/*
-.coverage
-tests/__pycache__/*
-*.tif.aux.xml
-validation dataset/Sentinel-2/dataset/*
-validation dataset/Landsat/dataset/*
+test data/
+validation dataset/Sentinel-2/dataset/
+validation dataset/Landsat/dataset/
 validation dataset/PlanetScope/dataset*
-tests/custom_models/*
-omnicloudmask/models/.*
-omnicloudmask/models/models--NickWright--OmniCloudMask/*
-training/convert models.ipynb
-custom_models/*
-*.DS_Store
-omnicloudmask/models/*.safetensors
-training/__pycache__/*
+validation dataset/Throughput/speed test scenes/
+tests/speed test/speed test scenes/
+examples/PlanetScope data/
+
+# ===================================
+# Models and Checkpoints
+# ===================================
+omnicloudmask/models/*PT.pth
 omnicloudmask/models/*_PT_state.pth
-examples/Maxar data/*
-examples/PlanetScope data/*
-tests/speed test/speed test scenes/*
-*.gpkg
-*.tif
-*.png
+omnicloudmask/models/*.safetensors
+omnicloudmask/models/.*
+omnicloudmask/models/models--NickWright--OmniCloudMask/
+tests/custom_models/
+custom_models/
 ckpts/
 models/
-*.pyc
-validation dataset/Throughput/speed test scenes/*
-training/scripts/local_config.py
+*.pth
+*.h5
+*.hdf5
+*.pb
+*.onnx
+*.pkl
+*.pickle
+
+# ===================================
+# Geospatial and Image Files
+# ===================================
+*.tif
+*.tiff
+*.TIF
+*.TIFF
+*.tif.aux.xml
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.kml
+*.kmz
 *.iiq
+
+# Image formats
+*.png
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.gif
+*.bmp
+*.svg
+*.ico
+*.webp
+
+# ===================================
+# Documentation and Notebooks
+# ===================================
+training/convert models.ipynb
+
+# ===================================
+# Testing and Coverage
+# ===================================
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ===================================
+# Logs
+# ===================================
+*.log
+logs/
+*.out
+*.err
+
+# ===================================
+# Configuration
+# ===================================
+training/scripts/local_config.py
+.env
+.env.local
+.env.*.local
+*.secret
+secrets/
+config.local.*
+
+# ===================================
+# Archives
+# ===================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.bz2
+*.gz
+*.xz
+
+# ===================================
+# Database
+# ===================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ===================================
+# Temporary Files
+# ===================================
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+.cache/
+tmp/
+temp/
+
+# ===================================
+# Other Common Excludes
+# ===================================
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+node_modules/
+.npm/
+package-lock.json
+yarn.lock
