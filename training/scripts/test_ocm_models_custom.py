@@ -6,10 +6,8 @@ import numpy as np
 import torch
 import cv2
 import rasterio as rio
-from functools import partial
 import timm
-from fastai.vision.all import create_unet_model
-from safetensors.torch import load_file
+from custom_model_utils import build_custom_model, load_custom_weights
 
 import matplotlib
 matplotlib.use('Agg')
@@ -72,6 +70,7 @@ except ImportError:
 # --- CONFIGURATION ---
 # Defaults (can be overridden by local_config)
 MODEL_TYPE = getattr(sys.modules.get('local_config'), 'MODEL_TYPE', "regnety_004.pycls_in1k")
+MODEL_LIBRARY = getattr(sys.modules.get('local_config'), 'MODEL_LIBRARY', "fastai")
 NUM_CHANNELS = 3  # R, G, NIR
 MODEL_PATCH_SIZE = (509, 509)
 
@@ -118,31 +117,17 @@ class OCMTester:
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        # Create model architecture
-        timm_model = partial(
-            timm.create_model,
-            MODEL_TYPE,
-            pretrained=False,
+        # Create model architecture using custom wrapper
+        model = build_custom_model(
+            model_name=MODEL_TYPE,
+            model_library=MODEL_LIBRARY,
             in_chans=NUM_CHANNELS,
-        )
-        model = create_unet_model(
-            img_size=MODEL_PATCH_SIZE,
-            arch=timm_model,
-            n_out=4, # Clear, Thick, Thin, Shadow
-            pretrained=False,
-            act_cls=torch.nn.Mish,
+            n_out=4,
         )
 
         # Load weights
         try:
-            if model_path.suffix == '.safetensors':
-                state_dict = load_file(model_path)
-            else:
-                state_dict = torch.load(model_path, map_location='cpu')
-            
-            model.load_state_dict(state_dict, strict=False)
-            model.to(self.device)
-            model.eval()
+            load_custom_weights(model, model_path, device=self.device, strict=False)
             logger.info("Model loaded successfully.")
             return model
         except Exception as e:

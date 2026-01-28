@@ -22,7 +22,7 @@ training_dir = current_script_dir.parent
 if str(training_dir) not in sys.path:
     sys.path.append(str(training_dir))
 
-# Add project root to path to import omnicloudmask if needed
+    # Add project root to path to import omnicloudmask if needed
 project_root = training_dir.parent
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
@@ -31,11 +31,11 @@ if str(project_root) not in sys.path:
 import torch
 import rasterio as rio
 from fastai.vision.all import * 
-from safetensors.torch import save_file, load_file
+from safetensors.torch import save_file
 import timm
 from rasterio.enums import Resampling
 from rasterio.errors import NotGeoreferencedWarning
-
+from custom_model_utils import build_custom_model, load_custom_weights
 # Local imports from training/
 try:
     from augs import (
@@ -100,6 +100,7 @@ def main():
     # --- CONFIGURATION ---
     # Set model type to match the checkpoint we want to fine-tune
     model_type = "regnety_004.pycls_in1k" 
+    model_library = "fastai"
     model_version = CUSTOM_MODEL_VERSION
     
     use_bf16 = True
@@ -152,19 +153,12 @@ def main():
     logger.info(f"Number of input channels: {num_input_channels}")
 
     # --- MODEL SETUP ---
-    logger.info(f"Creating model: {model_type}")
-    timm_model = partial(
-        timm.create_model,
-        model_type,
-        pretrained=True,
+    logger.info(f"Creating model: {model_type} ({model_library})")
+    model = build_custom_model(
+        model_name=model_type,
+        model_library=model_library,
         in_chans=num_input_channels,
-    )
-    model = create_unet_model(
-        img_size=(509, 509),
-        arch=timm_model,
         n_out=4,
-        pretrained=True,
-        act_cls=torch.nn.Mish,
     )
 
     # --- LOAD PRETRAINED WEIGHTS ---
@@ -174,13 +168,7 @@ def main():
     if pretrained_weights_path.exists():
         logger.info(f"Loading pretrained weights from {pretrained_weights_path}")
         try:
-            # Load safetensors file
-            state_dict = load_file(pretrained_weights_path)
-            
-            # Load into model
-            # strict=False is often useful if there are minor mismatches (e.g. head size), 
-            # though here we expect a match if it's the same model architecture.
-            model.load_state_dict(state_dict, strict=False)
+            load_custom_weights(model, pretrained_weights_path, strict=False)
             logger.info("Successfully loaded pretrained weights.")
         except Exception as e:
             logger.error(f"Error loading pretrained weights: {e}")

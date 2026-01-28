@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Centralized Model Versioning
 # Change this in one place to affect training outputs and testing inputs
-CUSTOM_MODEL_VERSION = "OCM_7.43_R_G_NIR_test_4"
+CUSTOM_MODEL_VERSION = "OCM_test_7"
 
 # Optimization Settings
 # Set to True if you want to use dual-resolution processing (if supported by loader)
@@ -88,3 +88,35 @@ SCALE_FACTOR = 1
 # 3. SYNTHETIC NIR
 # Set to True ONLY if you are using RGB data and need to fake the NIR band.
 GENERATE_SYNTHETIC_NIR = False 
+
+# ------------------------------------------------------------------------------
+# 7. Model Library & Compilation Config (v1.7.0+)
+# ------------------------------------------------------------------------------
+MODEL_CONFIG = {
+    "v4": {
+        "model_library": "smp",
+        "models": ["tu-regnety_004", "tu-edgenext_small"],
+        "weight_format": ".safetensors"
+    },
+    "v3": {
+        "model_library": "fastai",
+        "models": ["regnety_004", "edgenext_small"],
+        "weight_format": ".safetensors"
+    },
+    "v2": {
+        "model_library": "fastai",
+        "models": ["regnety_004", "edgenext_small"],
+        "weight_format": ".safetensors"
+    },
+    "v1": {
+        "model_library": "fastai",
+        "models": ["regnety_004", "convnextv2_nano"],
+        "weight_format": ".pth"
+    }
+}
+
+INFERENCE_CONFIG = {
+    "compile_models": False,  # Set to True for production
+    "compile_mode": "default",
+    "inference_dtype": "float32"
+}

@@ -9,6 +9,7 @@ import torch
 from fastai.torch_core import default_device
 from matplotlib import pyplot as plt
 
+from training.scripts.custom_model_utils import build_custom_model
 
 def plot_batch(batch, image_num=0, labels: Optional[list[str]] = None):
     # Load one batch of data

@@ -233,3 +233,5 @@ node_modules/
 .npm/
 package-lock.json
 yarn.lock
+UPGRADE_OCM.md
+training/scripts/REFACTORING_SUMMARY.md

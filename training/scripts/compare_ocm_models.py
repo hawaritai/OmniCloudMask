@@ -7,8 +7,6 @@ import cv2
 import rasterio as rio
 from functools import partial
 import timm
-from fastai.vision.all import create_unet_model
-from safetensors.torch import load_file
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -18,6 +16,9 @@ import json
 import pandas as pd
 import seaborn as sns
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, jaccard_score, precision_recall_curve, average_precision_score
+
+from custom_model_utils import build_custom_model, load_custom_weights
+from omnicloudmask.model_utils import compile_torch_model, load_model_from_weights
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -69,13 +70,24 @@ try:
             COMPARISON_QUICK_TEST,
             COMPARISON_QUICK_TEST_SAMPLES,
             COMPARISON_BATCH_SIZE,
-            COMPARISON_USE_BF16
+            COMPARISON_USE_BF16,
+            MODEL_CONFIG,
+            INFERENCE_CONFIG
         )
     except ImportError:
         COMPARISON_QUICK_TEST = True
         COMPARISON_QUICK_TEST_SAMPLES = 50
         COMPARISON_BATCH_SIZE = 8
         COMPARISON_USE_BF16 = True
+        MODEL_CONFIG = {
+            "v4": {"model_library": "smp"},
+            "v3": {"model_library": "fastai"}
+        }
+        INFERENCE_CONFIG = {
+            "compile_models": False,
+            "compile_mode": "default",
+            "inference_dtype": "float32"
+        }
         
 except ImportError:
     logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py'.")
@@ -90,19 +102,7 @@ GENERATE_SYNTHETIC_NIR = False # Set to False for comparison script as we assume
 
 # --- MODEL CONFIGURATIONS ---
 # Define models to compare here
-model_configs = [
-    {
-        'name': 'Tuned OCM 7.43_v4',
-        'path': Path(r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\2_Repo\OmniCloudMask\models\PM_model_OCM_7.43_R_G_NIR_test_4_regnety_004.pycls_in1k_PT_state.safetensors"),
-        'model_type': 'regnety_004.pycls_in1k'
-    },
-    # Add more models as needed:
-    # {
-    #     'name': 'Fine-tuned Model v1',
-    #     'path': Path("models/PM_model_v1_regnety_004.pycls_in1k_PT_state.safetensors"),
-    #     'model_type': 'regnety_004.pycls_in1k'
-    # },
-]
+model_configs = []
 
 # Auto-discover models from models directory (Optional)
 models_dir = project_root / "ckpts"
@@ -113,14 +113,39 @@ if models_dir.exists():
             continue
             
         model_name = model_file.stem.replace("_state", "").replace("PM_model_", "")
+        
+        # Infer library
+        if "smp" in model_name.lower():
+            lib = "smp"
+        else:
+            lib = "fastai"
+
         # Try to infer model type from name or default
-        model_type = 'regnety_004.pycls_in1k'
+        if "regnety_004" in model_name.lower():
+            model_type = 'tu-regnety_004' if lib == 'smp' else 'regnety_004.pycls_in1k'
+        elif "edgenext_small" in model_name.lower():
+            model_type = 'tu-edgenext_small' if lib == 'smp' else 'edgenext_small.usi_in1k'
+        elif "convnextv2_nano" in model_name.lower():
+            model_type = 'tu-convnextv2_nano' if lib == 'smp' else 'convnextv2_nano.fcmae_ft_in1k'
+        else:
+            # Fallback default
+            model_type = 'tu-regnety_004' if lib == 'smp' else 'regnety_004.pycls_in1k'
         
         model_configs.append({
             'name': model_name,
             'path': model_file,
-            'model_type': model_type
+            'model_type': model_type,
+            'model_library': lib
         })
+
+    model_configs.append(
+        {
+            'name': 'Tuned OCM 7.43_v4',
+            'path': Path(r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\2_Repo\OmniCloudMask\models\PM_model_OCM_7.43_R_G_NIR_test_4_regnety_004.pycls_in1k_PT_state.safetensors"),
+            'model_type': 'regnety_004.pycls_in1k',
+            'model_library': 'fastai' # Assuming this specific file is legacy based on name. Change to 'smp' if it's a V4 training.
+        }
+    )
 
 class ModelComparator:
     def __init__(self, output_dir):
@@ -139,6 +164,7 @@ class ModelComparator:
     def load_model(self, model_config):
         path = model_config['path']
         model_type = model_config['model_type']
+        model_library = model_config.get('model_library', 'smp') # Default to smp for new
         
         # Handle relative paths
         if not path.exists():
@@ -149,37 +175,35 @@ class ModelComparator:
             logger.error(f"Model file not found: {path}, skipping...")
             return None
 
-        logger.info(f"Loading model: {model_config['name']} from {path}")
+        logger.info(f"Loading model: {model_config['name']} from {path} ({model_library})")
         
         try:
-            # Create model architecture
-            timm_model = partial(
-                timm.create_model,
-                model_type,
-                pretrained=False,
+            # Create model architecture using build_model
+            model = build_custom_model(
+                model_name=model_type,
+                model_library=model_library,
                 in_chans=NUM_CHANNELS,
-            )
-            model = create_unet_model(
-                img_size=MODEL_PATCH_SIZE,
-                arch=timm_model,
-                n_out=len(CLASS_NAMES),
-                pretrained=False,
-                act_cls=torch.nn.Mish,
+                n_out=len(CLASS_NAMES)
             )
             
             # Load weights
-            if path.suffix == '.safetensors':
-                state_dict = load_file(path)
-            else:
-                state_dict = torch.load(path, map_location='cpu')
-            
-            model.load_state_dict(state_dict, strict=False)
-            model.to(DEVICE)
-            model.eval()
+            load_custom_weights(model, path, device=DEVICE, strict=False)
             
             if COMPARISON_USE_BF16 and DEVICE.type == 'cuda':
                 model = model.bfloat16()
-                
+            
+            # Optional Compilation
+            if INFERENCE_CONFIG.get("compile_models", False):
+                 logger.info("Compiling model...")
+                 model = compile_torch_model(
+                     model, 
+                     patch_size=MODEL_PATCH_SIZE[0],
+                     batch_size=COMPARISON_BATCH_SIZE, 
+                     dtype=torch.bfloat16 if COMPARISON_USE_BF16 else torch.float32,
+                     device=DEVICE,
+                     compile_mode=INFERENCE_CONFIG.get("compile_mode", "default")
+                 )
+
             return model
         except Exception as e:
             logger.error(f"Failed to load model {model_config['name']}: {e}")

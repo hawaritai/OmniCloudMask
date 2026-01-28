@@ -222,6 +222,80 @@ def build_fastai_model(
     return model
 
 
+def build_model(
+    model_name: str,
+    model_library: str,
+    in_chans: int = 3,
+    n_out: int = 4,
+    encoder_weights: Optional[str] = None,
+) -> torch.nn.Module:
+    """Build a segmentation model from either fastai or segmentation-models-pytorch.
+    
+    Args:
+        model_name: Name of the architecture (e.g. 'regnety_004')
+        model_library: Either 'fastai' or 'smp'
+        in_chans: Number of input channels
+        n_out: Number of output classes
+        encoder_weights: Pre-trained encoder weights for smp models (e.g. 'imagenet')
+        
+    Returns:
+        The PyTorch model
+    """
+    if model_library == "fastai":
+        return build_fastai_model(
+            model_name=model_name, in_chans=in_chans, n_out=n_out
+        )
+    elif model_library == "smp":
+        return smp.Unet(
+            encoder_name=model_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_chans,
+            classes=n_out,
+        )
+    else:
+        raise ValueError(
+            f"Invalid model_library: {model_library}. Must be one of 'fastai' or 'smp'."
+        )
+
+
+def load_weights(
+    model: torch.nn.Module,
+    weights_path: Union[Path, str],
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    strict: bool = True,
+) -> torch.nn.Module:
+    """Load weights from a file into a model.
+    
+    Args:
+        model: The model to load weights into
+        weights_path: Path to the weights file (.safetensors or .pth)
+        device: Optional device to move the model to
+        dtype: Optional dtype to convert the model to
+        strict: Whether to strictly enforce that the keys in state_dict match
+        
+    Returns:
+        The model with loaded weights
+    """
+    weights_path = Path(weights_path)
+    if weights_path.suffix == ".safetensors":
+        model_state = load_file(weights_path)
+    elif weights_path.suffix == ".pth":
+        model_state = torch.load(weights_path, weights_only=True, map_location="cpu")
+    else:
+        raise ValueError(
+            "Unsupported file format. Only .safetensors and .pth files are supported."
+        )
+
+    model.load_state_dict(model_state, strict=strict)
+    model.eval()
+
+    if device is not None or dtype is not None:
+        model = model.to(device=device, dtype=dtype)
+    
+    return model
+
+
 @lru_cache(maxsize=2)
 def load_model_from_weights(
     model_name: str,
@@ -235,38 +309,24 @@ def load_model_from_weights(
     patch_size: int = 1000,
     batch_size: int = 1,
     compile_mode: str = "default",
+    encoder_weights: Optional[str] = None,
 ) -> torch.nn.Module:
-    """Build Fastai DynamicUnet model from timm model and load weights from file"""
-    if model_library == "fastai":
-        model = build_fastai_model(
-            model_name=model_name, in_chans=in_chans, n_out=n_out
-        )
-    elif model_library == "smp":
-        model = smp.Unet(
-            encoder_name=model_name,
-            encoder_weights=None,
-            in_channels=in_chans,
-            classes=n_out,
-        )
-    else:
-        raise ValueError(
-            f"Invalid model_library: {model_library}. Must be one of 'fastai' or 'smp'."
-        )
+    """Build model and load weights from file"""
+    model = build_model(
+        model_name=model_name,
+        model_library=model_library,
+        in_chans=in_chans,
+        n_out=n_out,
+        encoder_weights=encoder_weights
+    )
 
-    # If using the v2+ weights then the file will be saved as a .safetensors file
-    if Path(weights_path).suffix == ".safetensors":
-        model_state = load_file(weights_path)
-
-    elif Path(weights_path).suffix == ".pth":
-        model_state = torch.load(weights_path, weights_only=True)
-    else:
-        raise ValueError(
-            "Unsupported file format. Only .safetensors and .pth files are supported."
-        )
-    model.load_state_dict(model_state)
-    model.eval()
-
-    model = model.to(device=device, dtype=dtype)
+    model = load_weights(
+        model=model,
+        weights_path=weights_path,
+        device=device,
+        dtype=dtype,
+        strict=True
+    )
 
     if compile_models:
         model = compile_torch_model(
