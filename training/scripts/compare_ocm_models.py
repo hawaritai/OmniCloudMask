@@ -395,10 +395,8 @@ class ModelComparator:
         metrics['per_class'] = {}
         
         # PR Curve data (requires probabilities)
-        # Flatten probabilities: (N, C)
         # Reshape probs: (B, C, H, W) -> (B*H*W, C)
         y_probs_flat = y_probs.transpose(0, 2, 3, 1).reshape(-1, len(CLASS_NAMES))
-        y_probs_valid = y_probs_flat[valid_mask]
         
         metrics['pr_data'] = {}
         avg_aps = []
@@ -412,9 +410,17 @@ class ModelComparator:
             }
             
             # PR Curve for this class
+            # CRITICAL FIX: Filter probabilities per-class based on valid labels
+            # Only include pixels where true label is valid (not invalid/out-of-range)
+            class_valid_mask = (y_true_flat >= 0) & (y_true_flat < len(CLASS_NAMES))
+            
+            # Apply class-specific mask to probabilities and labels
+            y_probs_class_valid = y_probs_flat[class_valid_mask]
+            y_true_class_valid = y_true_flat[class_valid_mask]
+            
             # Binarize true labels for this class
-            y_true_cls = (y_true_valid == i).astype(int)
-            y_score_cls = y_probs_valid[:, i]
+            y_true_cls = (y_true_class_valid == i).astype(int)
+            y_score_cls = y_probs_class_valid[:, i]
             
             prec, rec, _ = precision_recall_curve(y_true_cls, y_score_cls)
             ap = average_precision_score(y_true_cls, y_score_cls)
@@ -423,12 +429,14 @@ class ModelComparator:
             avg_aps.append(ap)
             
             # Downsample PR curve for saving to JSON (too large otherwise)
-            # Take 100 points
+            # Use 100 points with linear interpolation for smoother curves
             if len(prec) > 100:
-                indices = np.linspace(0, len(prec)-1, 100, dtype=int)
+                recall_interp = np.linspace(0, 1, 100)
+                # Reverse arrays for interpolation (recall is decreasing in sklearn output)
+                prec_interp = np.interp(recall_interp, rec[::-1], prec[::-1])
                 metrics['pr_data'][name] = {
-                    'precision': prec[indices].tolist(),
-                    'recall': rec[indices].tolist(),
+                    'precision': prec_interp.tolist(),
+                    'recall': recall_interp.tolist(),
                     'ap': float(ap)
                 }
             else:
@@ -442,10 +450,14 @@ class ModelComparator:
             
         metrics['Mean_AP'] = np.mean(avg_aps)
         
-        # Confusion Matrix
+        # Confusion Matrix (normalized for visualization)
         from sklearn.metrics import confusion_matrix
         cm = confusion_matrix(y_true_valid, y_pred_valid, labels=range(len(CLASS_NAMES)), normalize='true')
         metrics['confusion_matrix'] = cm.tolist()
+        
+        # Raw Confusion Matrix (for detailed analysis)
+        cm_raw = confusion_matrix(y_true_valid, y_pred_valid, labels=range(len(CLASS_NAMES)), normalize=None)
+        metrics['confusion_matrix_raw'] = cm_raw.tolist()
         
         return metrics
 
@@ -519,6 +531,22 @@ class ModelComparator:
             
         plt.tight_layout()
         plt.savefig(self.plots_dir / 'confusion_matrices.png')
+        plt.close()
+        
+        # 3b. Raw Confusion Matrices (for detailed analysis)
+        fig, axes = plt.subplots(1, num_models, figsize=(6 * num_models, 5))
+        if num_models == 1: axes = [axes]
+        
+        for ax, (model_name, m) in zip(axes, all_metrics.items()):
+            cm_raw = np.array(m['confusion_matrix_raw'])
+            sns.heatmap(cm_raw, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
+            ax.set_title(f'Raw Confusion Matrix: {model_name}')
+            ax.set_ylabel('True Label')
+            ax.set_xlabel('Predicted Label')
+            
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'confusion_matrices_raw.png')
         plt.close()
         
         # 4. PR Curves
