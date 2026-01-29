@@ -57,13 +57,13 @@ except ImportError as e:
 try:
     from local_config import (
         PREPROCESS_BASE_DIR,
-        DUPLICATED_IMAGE_DIR,
-        DUPLICATED_MASK_DIR,
+        PREPROCESS_INPUT_IMAGES_DIR,
+        PREPROCESS_INPUT_LABELS_DIR,
         PREPROCESS_OUTPUT_DIR
     )
     BASE_DATA_DIR = PREPROCESS_BASE_DIR
-    INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR  # Changed from PREPROCESS_INPUT_IMAGES_DIR
-    INPUT_LABELS_DIR = DUPLICATED_MASK_DIR   # Changed from PREPROCESS_INPUT_LABELS_DIR
+    INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR  # Changed from PREPROCESS_INPUT_IMAGES_DIR
+    INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR   # Changed from PREPROCESS_INPUT_LABELS_DIR
     OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
 except ImportError:
     logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")

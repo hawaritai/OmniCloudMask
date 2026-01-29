@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from matplotlib import pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
-from omnicloudmask import predict_from_array
-import omnicloudmask
 import cv2
 # Add parent directory to path to import from thirdparty
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from omnicloudmask import predict_from_array
+import omnicloudmask
 from thirdparty.NIRGAN.create_NIR import get_NIR
 from rgb_nir_handler import RGBNIRHandler, prepare_rgb_with_synthetic_nir
 import math
@@ -77,34 +78,34 @@ class OmniCloudShadowDetector:
         if nir.ndim == 2:
             nir = nir.unsqueeze(0)  # Add channel dimension -> (1, H, W)
             
-        # Scale red, green and nir bands
-        red = torch.clamp(rgb_tensor_resized[0] * 3, 0, 65535)
-        green = torch.clamp(rgb_tensor_resized[1] * 2, 0, 65535)
-        nir = torch.clamp(nir * 1, 0, 65535)
+        # # Scale red, green and nir bands
+        # red = torch.clamp(rgb_tensor_resized[0] * 3, 0, 65535)
+        # green = torch.clamp(rgb_tensor_resized[1] * 2, 0, 65535)
+        # nir = torch.clamp(nir * 1, 0, 65535)
         # Stack to create Red-Green-NIR input
-        rgn_stack = torch.stack([red, green, nir.squeeze(0)], dim=0)
-        rgn_stack = rgn_stack.cpu().numpy()
+        # rgn_stack = torch.stack([red, green, nir.squeeze(0)], dim=0)
+        # rgn_stack = rgn_stack.cpu().numpy()
 
 
-        # red = torch.clamp(rgb_tensor_resized[0], 0, 65535)
-        # green = torch.clamp(rgb_tensor_resized[1], 0, 65535)
+        red = torch.clamp(rgb_tensor_resized[0], 0, 65535)
+        green = torch.clamp(rgb_tensor_resized[1], 0, 65535)
 
-        # # by using normalize  
-        # normalize = True
-        # scale_to_dn = True
-        # dn_range = ((0, 10000))
-        # handler = RGBNIRHandler(device=self.device)
-        # red = red.cpu().numpy()
-        # green = green.cpu().numpy()
-        # nir = nir[0].cpu().numpy()
-        # rgn_stack = handler.stack_rgb_nir(
-        #     red=red,
-        #     green=green,
-        #     nir=nir,
-        #     normalize=normalize,
-        #     scale_to_dn=scale_to_dn,
-        #     dn_range=dn_range
-        # )
+        # by using normalize  
+        normalize = True
+        scale_to_dn = True
+        dn_range = ((0, 10000))
+        handler = RGBNIRHandler(device=self.device)
+        red = red.cpu().numpy()
+        green = green.cpu().numpy()
+        nir = nir[0].cpu().numpy()
+        rgn_stack = handler.stack_rgb_nir(
+            red=red,
+            green=green,
+            nir=nir,
+            normalize=normalize,
+            scale_to_dn=scale_to_dn,
+            dn_range=dn_range
+        )
         return rgn_stack, rgb_tensor_resized.cpu().numpy()
     
 
@@ -186,7 +187,7 @@ class OmniCloudShadowDetector:
             # Read image as HWC
             rgb_array = np.transpose(src.read(), (1, 2, 0))
 
-        RES_DEFAULT = (480, 520)
+        RES_DEFAULT = (480, 640)
         RES_SMALL = (160, 220)
         # RES_DEFAULT = (480, 520)
         # RES_SMALL = (160, 220)
@@ -311,7 +312,7 @@ if __name__ == "__main__":
         img_dir = sys.argv[1]
     else:
         # The user-provided image path as a default
-        img_dir = r"D:\Projects\QI47\2025_Projects\Image_QC\1_Data\Kavel10Data\testjanuary\dataset3\certiflAI_detected_clouds"
+        img_dir = r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\2_Repo\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D\images"
     
     if not os.path.exists(img_dir):
         logger.error(f"Error: The path does not exist: {img_dir}")

@@ -154,9 +154,9 @@ class RGBNIRHandler:
         
         # Normalize if requested
         if normalize:
-            red = self.normalize_band(red, method="percentile")
-            green = self.normalize_band(green, method="percentile")
-            nir = self.normalize_band(nir, method="percentile")
+            red = self.normalize_band(red, method="stddev")
+            green = self.normalize_band(green, method="stddev")
+            nir = self.normalize_band(nir, method="stddev")
         
         # Scale to DN range if requested
         if scale_to_dn:
