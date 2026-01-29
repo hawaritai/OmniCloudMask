@@ -56,23 +56,48 @@ except ImportError as e:
 # --- CONFIGURATION ---
 try:
     from local_config import (
-        PREPROCESS_BASE_DIR,
         PREPROCESS_INPUT_IMAGES_DIR,
         PREPROCESS_INPUT_LABELS_DIR,
         PREPROCESS_OUTPUT_DIR
     )
-    BASE_DATA_DIR = PREPROCESS_BASE_DIR
-    INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR  # Changed from PREPROCESS_INPUT_IMAGES_DIR
-    INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR   # Changed from PREPROCESS_INPUT_LABELS_DIR
+
+    # INPUT_IMAGES_DIR = Path(r"E:\ImageQC\dataset\Test_all_gt\images_pos")
+    # INPUT_LABELS_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_masks")
+    # OUTPUT_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\processed_data_upscale")
+
+    INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR
+    INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR
     OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
+    
 except ImportError:
-    logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
-    logger.critical("Required variables: PREPROCESS_BASE_DIR, DUPLICATED_IMAGE_DIR, DUPLICATED_MASK_DIR, PREPROCESS_OUTPUT_DIR")
+    logger.critical("CRITICAL: local_config.py not found.")
+    logger.critical("Required variables: PREPROCESS_INPUT_IMAGES_DIR, PREPROCESS_INPUT_LABELS_DIR, PREPROCESS_OUTPUT_DIR")
     sys.exit(1)
 
-TARGET_GSD_M = 10.0  # Target resolution in meters (Match Sentinel-2 approx)
-SOURCE_GSD_M = 1  # Your source resolution (5cm) - ADJUST IF NEEDED
-TILE_SIZE = 509      # Required by OCM training script
+# Target size for smallest dimension
+TARGET_SIZE = 509
+
+def calculate_target_dimensions(curr_h, curr_w, target_size=509):
+    """
+    Calculate new dimensions where smallest side = target_size, preserving aspect ratio.
+    
+    Examples:
+        640×480 → 509×382 (width is smaller, scale to 509)
+        640×411 → 509×327 (height is smaller, scale to 509)
+        480×640 → 382×509 (width is smaller, scale to 509)
+    """
+    aspect_ratio = curr_w / curr_h
+    
+    if curr_w < curr_h:
+        # Width is smaller
+        new_w = target_size
+        new_h = int(target_size / aspect_ratio)
+    else:
+        # Height is smaller (or equal)
+        new_h = target_size
+        new_w = int(target_size * aspect_ratio)
+    
+    return new_h, new_w
 
 # --- PREPROCESSING METHOD TOGGLE ---
 # False: Use RGBNIRHandler with normalization (Method A)
@@ -92,53 +117,61 @@ def preprocess_images():
     # Create output directories
     (OUTPUT_DIR / "train").mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "validation").mkdir(parents=True, exist_ok=True)
-
-    # Calculate scale factor (e.g. 0.05 / 10 = 0.005)
-    scale_factor = SOURCE_GSD_M / TARGET_GSD_M
-    logger.info(f"Downsampling scale factor: {scale_factor} (Source: {SOURCE_GSD_M}m -> Target: {TARGET_GSD_M}m)")
-
+    
     # Find all images
-    image_files = list(INPUT_IMAGES_DIR.glob("*.tif"))
+    image_files = []
+    for ext in ['*.tif', '*.tiff', '*.jpg', '*.jpeg', '*.png']:
+        image_files.extend(INPUT_IMAGES_DIR.glob(ext))
+    
     logger.info(f"Found {len(image_files)} images to process.")
+    
+    stats = {
+        "total": 0,
+        "train": 0,
+        "validation": 0,
+        "skipped": 0,
+        "total_tiles": 0
+    }
 
-    for img_path in tqdm(image_files):
+    for img_path in tqdm(image_files, desc="Processing images"):
         # Look for label in label dir with same name
-        label_path = INPUT_LABELS_DIR / img_path.name
+        label_path = INPUT_LABELS_DIR / f"{img_path.stem}.tif"
         
         if not label_path.exists():
-            logger.warning(f"Skipping {img_path.name}, label not found in {INPUT_LABELS_DIR}")
+            logger.warning(f"Skipping {img_path.name}, label not found")
+            stats["skipped"] += 1
             continue
-
+        
         try:
             with rasterio.open(img_path) as src_img, rasterio.open(label_path) as src_lbl:
-                # 1. Calculate new dimensions after downsampling
-                new_height = int(src_img.height * scale_factor)
-                new_width = int(src_img.width * scale_factor)
+                # Get current dimensions
+                curr_h, curr_w = src_img.shape
                 
-                # Check for minimum dimensions
-                if new_height < 1 or new_width < 1:
-                    logger.warning(f"Skipping {img_path.name}: Downsampled size too small ({new_width}x{new_height})")
-                    continue
-
-                # 2. Read and Resample (Downsample) entire image to memory
-                # Read RGB (3 bands)
-                count = min(3, src_img.count)
+                # Calculate target dimensions (smallest side = 509)
+                new_h, new_w = calculate_target_dimensions(curr_h, curr_w, TARGET_SIZE)
+                
+                logger.info(f"{img_path.name}: {curr_w}×{curr_h} → {new_w}×{new_h}")
+                
+                # Read all bands from image
+                count = src_img.count
                 if count < 3:
-                    logger.warning(f"Skipping {img_path.name}: Not enough bands ({count})")
+                    logger.warning(f"Skipping {img_path.name}: Only {count} bands")
+                    stats["skipped"] += 1
                     continue
-                    
+                
+                # Upsample image (use first 3 bands as RGB)
                 data_img_rgb = src_img.read(
-                    [1, 2, 3], # Read bands 1, 2, 3 (RGB)
-                    out_shape=(3, new_height, new_width),
+                    [1, 2, 3],
+                    out_shape=(3, new_h, new_w),
                     resampling=Resampling.bilinear
                 )
                 
-                # Use nearest neighbor for labels to preserve class integers (0,1,2,3)
+                # Upsample mask (use nearest neighbor to preserve class values)
                 data_lbl = src_lbl.read(
-                    out_shape=(src_lbl.count, new_height, new_width),
+                    out_shape=(src_lbl.count, new_h, new_w),
                     resampling=Resampling.nearest
                 )
-
+                
                 # --- 2b. Generate NIR and Stack ---
                 # Prepare RGB for NIRGAN (H, W, 3)
                 rgb_for_gan = np.transpose(data_img_rgb, (1, 2, 0)) # CHW -> HWC
@@ -158,9 +191,9 @@ def preprocess_images():
                 nir_synthetic = get_NIR(rgb_for_gan_u8, device=device)
                 
                 # --- RESIZE NIR TO MATCH RGB IF NEEDED ---
-                if nir_synthetic.shape != (new_height, new_width):
+                if nir_synthetic.shape != (new_h, new_w):
                     nir_synthetic = nir_synthetic.astype(np.float32)
-                    nir_synthetic = cv2.resize(nir_synthetic, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+                    nir_synthetic = cv2.resize(nir_synthetic, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
                 # --- STACKING LOGIC ---
                 if USE_METHOD_B_PREPROCESSING:
@@ -209,79 +242,108 @@ def preprocess_images():
                         scale_to_dn=True,
                         dn_range=(0, 10000)
                     )
+
+                # Tile into 509×509 patches
+                # Calculate number of tiles
+                n_cols = math.ceil(new_w / TARGET_SIZE)
+                n_rows = math.ceil(new_h / TARGET_SIZE)
                 
-                # rgn_stack is (3, H, W) float32
-
-                # 3. Tile into 509x509 patches
-                n_cols = math.ceil(new_width / TILE_SIZE)
-                n_rows = math.ceil(new_height / TILE_SIZE)
-
+                tile_count = 0
                 for row in range(n_rows):
                     for col in range(n_cols):
                         # Define window
-                        x_off = col * TILE_SIZE
-                        y_off = row * TILE_SIZE
+                        x_off = col * TARGET_SIZE
+                        y_off = row * TARGET_SIZE
                         
-                        # Adjust offset if tile exceeds boundaries (force overlap for last tiles)
-                        if x_off + TILE_SIZE > new_width:
-                            x_off = max(0, new_width - TILE_SIZE)
+                        # Adjust if tile exceeds boundaries (force overlap for last tiles)
+                        if x_off + TARGET_SIZE > new_w:
+                            x_off = max(0, new_w - TARGET_SIZE)
                         
-                        if y_off + TILE_SIZE > new_height:
-                            y_off = max(0, new_height - TILE_SIZE)
-
-                        # Extract tile from RGN stack
-                        tile_img = rgn_stack[:, y_off:y_off+TILE_SIZE, x_off:x_off+TILE_SIZE]
+                        if y_off + TARGET_SIZE > new_h:
+                            y_off = max(0, new_h - TARGET_SIZE)
+                        
+                        # Extract tile from image
+                        tile_img = rgn_stack[:, y_off:y_off+TARGET_SIZE, x_off:x_off+TARGET_SIZE]
                         
                         # Extract tile from label
-                        tile_lbl = data_lbl[:, y_off:y_off+TILE_SIZE, x_off:x_off+TILE_SIZE]
-
-                        # Verify it's not empty (optional)
-                        if tile_img.max() == 0: continue
-
-                        # Define output filenames
+                        tile_lbl = data_lbl[:, y_off:y_off+TARGET_SIZE, x_off:x_off+TARGET_SIZE]
+                        
+                        # Skip if tile is wrong size (shouldn't happen with above logic)
+                        if tile_img.shape[1] != TARGET_SIZE or tile_img.shape[2] != TARGET_SIZE:
+                            logger.warning(f"  Skipping tile {row}_{col}: wrong size {tile_img.shape}")
+                            continue
+                        
+                        # Skip if tile is completely empty
+                        if tile_img.max() == 0:
+                            continue
+                        
+                        # Randomly assign to train (80%) or validation (20%)
                         split_dir = "validation" if np.random.rand() < 0.2 else "train"
+                        if split_dir == "train":
+                            stats["train"] += 1
+                        else:
+                            stats["validation"] += 1
+                        
                         base_name = f"{img_path.stem}_tile_{row}_{col}"
                         
                         out_img_path = OUTPUT_DIR / split_dir / f"{base_name}_image.tif"
                         out_lbl_path = OUTPUT_DIR / split_dir / f"{base_name}_label.tif"
-
-                        # Create a transform for the tile
-                        # Use scale_factor to record the downsampling ratio
-                        # This maintains the relationship to original resolution
-                        dst_transform = rasterio.Affine(scale_factor, 0, 0, 0, scale_factor, 0)  # Preserve scale info
-
-                        # Save Tile (Image)
-                        profile = {
-                            'height': TILE_SIZE,
-                            'width': TILE_SIZE,
+                        
+                        # Identity transform for pixel coordinates
+                        dst_transform = rasterio.Affine(1, 0, 0, 0, 1, 0)
+                        
+                        # Save tile (Image)
+                        profile_img = {
+                            'height': TARGET_SIZE,
+                            'width': TARGET_SIZE,
                             'count': 3,
-                            'dtype': 'float32', 
+                            'dtype': 'float32',
                             'driver': 'GTiff',
                             'compress': 'lzw',
                             'transform': dst_transform,
-                            'crs': None # no CRS for training chips
+                            'crs': None
                         }
-
-                        with rasterio.open(out_img_path, 'w', **profile) as dst:
+                        
+                        with rasterio.open(out_img_path, 'w', **profile_img) as dst:
                             dst.write(tile_img)
                         
-                        # Save Tile (Label)
+                        # Save tile (Label)
                         profile_lbl = {
-                            'height': TILE_SIZE,
-                            'width': TILE_SIZE,
+                            'height': TARGET_SIZE,
+                            'width': TARGET_SIZE,
                             'count': 1,
                             'dtype': 'uint8',
                             'compress': 'lzw',
                             'transform': dst_transform,
                             'crs': None
                         }
+                        
                         with rasterio.open(out_lbl_path, 'w', **profile_lbl) as dst:
                             dst.write(tile_lbl)
-                            
+                        
+                        tile_count += 1
+                
+                stats["total"] += 1
+                stats["total_tiles"] += tile_count
+                logger.info(f"  Generated {tile_count} tiles")
+                
         except Exception as e:
             logger.error(f"Failed to process {img_path.name}: {e}")
             import traceback
             traceback.print_exc()
+            stats["skipped"] += 1
+    
+    # Print summary
+    logger.info("\n" + "="*80)
+    logger.info("PROCESSING COMPLETE - SUMMARY")
+    logger.info("="*80)
+    logger.info(f"Images processed: {stats['total']}")
+    logger.info(f"Images skipped: {stats['skipped']}")
+    logger.info(f"Total tiles generated: {stats['total_tiles']}")
+    logger.info(f"  Train: {stats['train']}")
+    logger.info(f"  Validation: {stats['validation']}")
+    logger.info(f"\nOutput directory: {OUTPUT_DIR}")
+    logger.info("="*80)
 
 if __name__ == "__main__":
     preprocess_images()
