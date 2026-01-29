@@ -11,6 +11,10 @@ IMPROVEMENTS:
 - Clean, professional naming without redundant suffixes
 - Safetensors as the primary output format (emphasized in logging)
 - Better error checking for safetensors file integrity
+- Automatic best model tracking: Saves both best and latest models during training
+  - Best model is selected based on dice_multi_strip metric (higher is better)
+  - Prevents overfitting by preserving the best performing model
+  - Both models are saved in safetensors and fastai learner formats
 """
 
 import sys
@@ -24,7 +28,7 @@ import cv2
 import logging
 from collections import defaultdict
 from functools import partial
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -274,6 +278,92 @@ def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) 
     except Exception as e:
         logger.error(f"  Safetensors integrity check failed: {e}")
         return False
+
+
+class SaveBestAndLatestModel(Callback):
+    """
+    Custom callback to save the best model (based on dice_multi_strip metric)
+    and the latest model after each epoch.
+    
+    This callback monitors the dice_multi_strip metric and saves the model
+    when a better score is achieved. It also saves the latest model at the end
+    of training.
+    """
+    
+    def __init__(
+        self,
+        monitor: str = 'dice_multi_strip',
+        model_save_path: Path = None,
+        learner_save_name: str = None,
+        save_format: str = 'safetensors'
+    ):
+        """
+        Args:
+            monitor: Metric name to monitor for best model (default: dice_multi_strip)
+            model_save_path: Directory path to save models
+            learner_save_name: Base name for saving fastai learner
+            save_format: Format to save models ('safetensors' or 'pth')
+        """
+        self.monitor = monitor
+        self.model_save_path = model_save_path
+        self.learner_save_name = learner_save_name
+        self.save_format = save_format
+        self.best_score = -float('inf')
+        self.best_epoch = 0
+        self.best_model_state = None
+        store_attr()
+    
+    def after_validate(self):
+        """Called after validation at the end of each epoch."""
+        # Get the current metric value
+        current_score = self.learn.recorder.values[-1][self.learn.recorder.metrics_names.index(self.monitor)]
+        
+        if current_score > self.best_score:
+            self.best_score = current_score
+            self.best_epoch = self.learn.epoch
+            # Save the best model state
+            self.best_model_state = {k: v.cpu().clone() for k, v in self.learn.model.state_dict().items()}
+            logger.info(f"  📈 New best model saved at epoch {self.learn.epoch} with {self.monitor}={current_score:.6f}")
+    
+    def after_fit(self):
+        """Called at the end of training."""
+        # Save the latest model
+        logger.info("\nSaving models...")
+        
+        # Save latest fastai learner
+        self.learn.save(f"{self.learner_save_name}_latest")
+        logger.info(f"  ✓ Saved latest Fastai learner: {self.learner_save_name}_latest")
+        
+        # Save best fastai learner
+        self.learn.save(f"{self.learner_save_name}_best")
+        logger.info(f"  ✓ Saved best Fastai learner: {self.learner_save_name}_best")
+        
+        # Convert to CPU and float32 for saving
+        model_cpu = self.learn.model.to("cpu").float()
+        
+        # Save latest model in safetensors/pytorch format
+        if self.save_format == 'safetensors':
+            latest_path = self.model_save_path / f"{self.learner_save_name}_latest.safetensors"
+            save_file(model_cpu.state_dict(), latest_path)
+            logger.info(f"  ✓ Saved latest model (safetensors): {latest_path.name}")
+            
+            # Save best model in safetensors format
+            if self.best_model_state is not None:
+                best_path = self.model_save_path / f"{self.learner_save_name}_best.safetensors"
+                save_file(self.best_model_state, best_path)
+                logger.info(f"  ✓ Saved best model (safetensors): {best_path.name}")
+                logger.info(f"  Best model from epoch {self.best_epoch} with {self.monitor}={self.best_score:.6f}")
+        else:
+            # Save in pytorch format
+            latest_path = self.model_save_path / f"{self.learner_save_name}_latest_state.pth"
+            torch.save(model_cpu.state_dict(), latest_path)
+            logger.info(f"  ✓ Saved latest model (pytorch): {latest_path.name}")
+            
+            if self.best_model_state is not None:
+                best_path = self.model_save_path / f"{self.learner_save_name}_best_state.pth"
+                torch.save(self.best_model_state, best_path)
+                logger.info(f"  ✓ Saved best model (pytorch): {best_path.name}")
+                logger.info(f"  Best model from epoch {self.best_epoch} with {self.monitor}={self.best_score:.6f}")
 
 
 def fine_tune_single_model(
@@ -556,6 +646,12 @@ def fine_tune_single_model(
         # --- TRAINING ---
         callbacks = [
             GradientAccumulation(training_config['gradient_accumulation_batch_size']),
+            SaveBestAndLatestModel(
+                monitor='dice_multi_strip',
+                model_save_path=models_dir,
+                learner_save_name=base_identifier,
+                save_format='safetensors'
+            ),
         ]
         
         logger.info("Initializing Learner...")
@@ -581,31 +677,49 @@ def fine_tune_single_model(
         )
         
         # --- SAVING ---
-        logger.info("\nSaving models...")
+        # Note: SaveBestAndLatestModel callback has already saved both best and latest models
+        # We now save additional formats and verify integrity
         
-        # Save Fastai learner
-        learner.save(fai_model_name)
-        logger.info(f"  ✓ Saved Fastai learner: {fai_model_name}")
+        # Get the best model info from the callback
+        save_best_callback = learner.cbs[-1]  # The last callback is our SaveBestAndLatestModel
+        best_dice_score = save_best_callback.best_score
+        best_epoch = save_best_callback.best_epoch
         
-        # Convert to CPU and float32 for saving
+        # Convert to CPU and float32 for additional saving
         model_cpu = learner.model.to("cpu").float()
         
-        # PRIORITY 1: Save safetensors (PRIMARY FORMAT)
-        logger.info(f"  Saving PRIMARY format: {safetensor_state_path.name}")
-        save_file(model_cpu.state_dict(), safetensor_state_path)
-        
-        # Verify safetensors integrity
-        safetensors_valid = verify_safetensors_integrity(safetensor_state_path, model_cpu)
-        if not safetensors_valid:
-            logger.error("  CRITICAL: Safetensors file failed integrity check!")
-            return False
-        
-        # Save additional formats
+        # Save additional formats for latest model
         torch.save(model_cpu.state_dict(), state_path)
-        logger.info(f"  ✓ Saved PyTorch state dict: {state_path.name}")
+        logger.info(f"  ✓ Saved latest PyTorch state dict: {state_path.name}")
         
         torch.save(model_cpu, pytorch_model_path)
-        logger.info(f"  ✓ Saved PyTorch full model: {pytorch_model_path.name}")
+        logger.info(f"  ✓ Saved latest PyTorch full model: {pytorch_model_path.name}")
+        
+        # Verify latest safetensors integrity (saved by callback)
+        latest_safetensors_path = models_dir / f"{base_identifier}_latest.safetensors"
+        safetensors_valid = verify_safetensors_integrity(latest_safetensors_path, model_cpu)
+        if not safetensors_valid:
+            logger.error("  CRITICAL: Latest safetensors file failed integrity check!")
+            return False
+        
+        # Verify best safetensors integrity (saved by callback)
+        best_safetensors_path = models_dir / f"{base_identifier}_best.safetensors"
+        if best_safetensors_path.exists():
+            # Load best model state for verification
+            best_state = load_file(best_safetensors_path)
+            # Create a temporary model for verification
+            temp_model = build_custom_model(
+                model_name=model_type,
+                model_library=model_library,
+                in_chans=training_config['num_input_channels'],
+                n_out=len(CLASS_NAMES)
+            )
+            temp_model.load_state_dict(best_state)
+            temp_model = temp_model.float()
+            safetensors_best_valid = verify_safetensors_integrity(best_safetensors_path, temp_model)
+            if not safetensors_best_valid:
+                logger.error("  CRITICAL: Best safetensors file failed integrity check!")
+                return False
         
         # Save configuration
         config = {
@@ -629,13 +743,22 @@ def fine_tune_single_model(
             "unfrozen_epochs": training_config['unfrozen_epochs'],
             "limit_training_images": training_config['limit_training_images'],
             "safetensors_integrity_verified": safetensors_valid,
+            "best_dice_score": float(best_dice_score),
+            "best_epoch": int(best_epoch),
         }
         with open(config_path, "w") as f:
             json.dump(config, f, indent=4)
         logger.info(f"  ✓ Saved config: {config_path.name}")
         
         logger.info(f"\n✓ Fine-tuning complete. Models saved to {models_dir}")
-        logger.info(f"  PRIMARY OUTPUT: {safetensor_state_path}")
+        logger.info(f"  BEST MODEL (dice_multi_strip={best_dice_score:.6f} at epoch {best_epoch}):")
+        logger.info(f"    - {base_identifier}_best.safetensors (PRIMARY - safetensors)")
+        logger.info(f"    - {base_identifier}_best.pth (fastai learner)")
+        logger.info(f"  LATEST MODEL:")
+        logger.info(f"    - {base_identifier}_latest.safetensors (PRIMARY - safetensors)")
+        logger.info(f"    - {base_identifier}_latest.pth (fastai learner)")
+        logger.info(f"    - {state_path.name} (PyTorch state dict)")
+        logger.info(f"    - {pytorch_model_path.name} (PyTorch full model)")
         
         # --- EVALUATION ---
         results_dir = output_base_dir / f"results_{base_identifier}"
@@ -853,6 +976,10 @@ def main():
     logger.info(f"Output directory: {output_base_dir}")
     logger.info(f"\nPRIMARY OUTPUT FORMAT: .safetensors files")
     logger.info(f"All safetensors files have been integrity-verified")
+    logger.info(f"\nFor each model, two versions are saved:")
+    logger.info(f"  - BEST model: Best performing model based on dice_multi_strip metric")
+    logger.info(f"  - LATEST model: Final model after all training epochs")
+    logger.info(f"This prevents overfitting by preserving the best performing model.")
     logger.info(f"{'='*80}\n")
 
 
