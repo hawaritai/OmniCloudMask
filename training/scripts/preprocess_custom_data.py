@@ -57,16 +57,17 @@ except ImportError as e:
 try:
     from local_config import (
         PREPROCESS_BASE_DIR,
-        PREPROCESS_INPUT_IMAGES_DIR,
-        PREPROCESS_INPUT_LABELS_DIR,
+        DUPLICATED_IMAGE_DIR,
+        DUPLICATED_MASK_DIR,
         PREPROCESS_OUTPUT_DIR
     )
     BASE_DATA_DIR = PREPROCESS_BASE_DIR
-    INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR
-    INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR
+    INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR  # Changed from PREPROCESS_INPUT_IMAGES_DIR
+    INPUT_LABELS_DIR = DUPLICATED_MASK_DIR   # Changed from PREPROCESS_INPUT_LABELS_DIR
     OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
 except ImportError:
     logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+    logger.critical("Required variables: PREPROCESS_BASE_DIR, DUPLICATED_IMAGE_DIR, DUPLICATED_MASK_DIR, PREPROCESS_OUTPUT_DIR")
     sys.exit(1)
 
 TARGET_GSD_M = 10.0  # Target resolution in meters (Match Sentinel-2 approx)
@@ -244,14 +245,13 @@ def preprocess_images():
                         out_img_path = OUTPUT_DIR / split_dir / f"{base_name}_image.tif"
                         out_lbl_path = OUTPUT_DIR / split_dir / f"{base_name}_label.tif"
 
-                        # Create a basic transform for the tile (we lose absolute georef but keep pixel scale relative)
-                        # We use an identity transform or similar since these are training chips
-                        # Or we can construct one if needed, but typically OCM training works on pixel values.
-                        dst_transform = rasterio.Affine(scale_factor, 0, 0, 0, -scale_factor, 0) # Simplified
+                        # Create a transform for the tile
+                        # Use scale_factor to record the downsampling ratio
+                        # This maintains the relationship to original resolution
+                        dst_transform = rasterio.Affine(scale_factor, 0, 0, 0, scale_factor, 0)  # Preserve scale info
 
                         # Save Tile (Image)
-                        profile = src_img.profile.copy()
-                        profile.update({
+                        profile = {
                             'height': TILE_SIZE,
                             'width': TILE_SIZE,
                             'count': 3,
@@ -259,15 +259,14 @@ def preprocess_images():
                             'driver': 'GTiff',
                             'compress': 'lzw',
                             'transform': dst_transform,
-                            'crs': None # remove CRS to avoid warnings if not valid
-                        })
+                            'crs': None # no CRS for training chips
+                        }
 
                         with rasterio.open(out_img_path, 'w', **profile) as dst:
                             dst.write(tile_img)
                         
                         # Save Tile (Label)
-                        profile_lbl = src_lbl.profile.copy()
-                        profile_lbl.update({
+                        profile_lbl = {
                             'height': TILE_SIZE,
                             'width': TILE_SIZE,
                             'count': 1,
@@ -275,7 +274,7 @@ def preprocess_images():
                             'compress': 'lzw',
                             'transform': dst_transform,
                             'crs': None
-                        })
+                        }
                         with rasterio.open(out_lbl_path, 'w', **profile_lbl) as dst:
                             dst.write(tile_lbl)
                             

@@ -7,15 +7,15 @@ from pathlib import Path
 
 # Centralized Model Versioning
 # Change this in one place to affect training outputs and testing inputs
-CUSTOM_MODEL_VERSION = "OCM_test_7"
+CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v2" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
 
 # Optimization Settings
 # Set to True if you want to use dual-resolution processing (if supported by loader)
-USE_DUAL_RES_METHOD = True
+USE_DUAL_RES_METHOD = False
 
 # Common Root for the Dataset (Optional helper)
-_DATASET_ROOT = Path(r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\2_Repo\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D")
-# _DATASET_ROOT = Path(r"D:\Projects\QI47\2025_Projects\Image_QC_GUI\1_Data\downsampled_images_recent_3_datasets\2051_102025077_D09_Arriege_E")
+_DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D")
+# _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\merged")
 
 # Repo Root (Optional helper, assuming this file is in training/scripts/)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,24 +25,39 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # ------------------------------------------------------------------------------
 PREPARE_MASKS_IMAGE_DIR = _DATASET_ROOT / "images"
 PREPARE_MASKS_GPKG_DIR = _DATASET_ROOT / "gpkg"
-PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "masks_3"
+PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "masks"
+
+# ------------------------------------------------------------------------------
+# 1.5. duplicate_positives.py (NEW - for dataset balancing)
+# ------------------------------------------------------------------------------
+# Output directories for duplicated data
+DUPLICATED_IMAGE_DIR = _DATASET_ROOT / "duplicated" / "images"
+DUPLICATED_MASK_DIR = _DATASET_ROOT / "duplicated" / "masks"
 
 # ------------------------------------------------------------------------------
 # 2. preprocess_custom_data.py
 # ------------------------------------------------------------------------------
 PREPROCESS_BASE_DIR = _DATASET_ROOT
-PREPROCESS_INPUT_IMAGES_DIR = _DATASET_ROOT / "images"
-PREPROCESS_INPUT_LABELS_DIR = _DATASET_ROOT / "masks_3"
+
+# OPTION A: Use original images (no duplication) - 60:200 ratio
+# PREPROCESS_INPUT_IMAGES_DIR = PREPARE_MASKS_IMAGE_DIR
+# PREPROCESS_INPUT_LABELS_DIR = PREPARE_MASKS_OUTPUT_DIR
+
+# OPTION B: Use duplicated dataset (balanced 180:200 ratio) - RECOMMENDED
+PREPROCESS_INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR
+PREPROCESS_INPUT_LABELS_DIR = DUPLICATED_MASK_DIR
+
 PREPROCESS_OUTPUT_DIR = _DATASET_ROOT / "processed_dataset_3"
 
 # ------------------------------------------------------------------------------
 # 3. train_ocm_models_custom.py
 # ------------------------------------------------------------------------------
 # Directory containing 'train' and 'validation' folders created by preprocess
-TRAIN_DATA_DIR = PREPROCESS_OUTPUT_DIR
+# TRAIN_DATA_DIR = PREPROCESS_OUTPUT_DIR
+TRAIN_DATA_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\merged_v3")
 
 # Path to the pretrained weights (checkpoint)
-TRAIN_PRETRAINED_WEIGHTS_PATH = _REPO_ROOT / "ckpts" / "PM_model_OCM_7.43_R_G_NIR_regnety_004.pycls_in1k_PT_state.safetensors"
+TRAIN_PRETRAINED_WEIGHTS_PATH = _REPO_ROOT / "ckpts" / "PM_model_OCM_6.43_RG_NIR_regnety_004.pycls_in1k_PT_state.safetensors"
 
 # ------------------------------------------------------------------------------
 # 4. test_ocm_models_custom.py
@@ -52,27 +67,12 @@ TEST_MODEL_PATH = _REPO_ROOT / "models" / f"PM_model_{CUSTOM_MODEL_VERSION}_regn
 
 # Directory of images to test on
 TEST_IMAGES_DIR = _DATASET_ROOT / "images"
-# TEST_IMAGES_DIR = PREPROCESS_OUTPUT_DIR / "validation"
 
 # Directory for test results
-TEST_OUTPUT_DIR = _REPO_ROOT / f"test_results_{CUSTOM_MODEL_VERSION}_v1"
+TEST_OUTPUT_DIR = _REPO_ROOT / f"test_results_{CUSTOM_MODEL_VERSION}"
 
 # ------------------------------------------------------------------------------
-# 5. compare_ocm_models.py
-# ------------------------------------------------------------------------------
-# Quick test mode (True = fast testing, False = full evaluation)
-# If True, it will randomly sample a subset of the validation data for speed.
-COMPARISON_QUICK_TEST = True
-COMPARISON_QUICK_TEST_SAMPLES = 50  # Number of samples for quick test
-
-# Batch size for evaluation
-COMPARISON_BATCH_SIZE = 16
-
-# Use bfloat16 precision (saves memory on Ampere GPUs)
-COMPARISON_USE_BF16 = False
-
-# ------------------------------------------------------------------------------
-# 6. Global Data Settings (Used by Train & Test)
+# 5. Global Data Settings (Used by Train & Test)
 # ------------------------------------------------------------------------------
 # 1. BAND SELECTION
 # If your images are [Red, Green, Blue, NIR], use [1, 2, 4] to get R-G-NIR
@@ -83,40 +83,8 @@ BAND_ORDER = [1, 2, 3]
 # Match the resolution used in training. 
 # If you trained on 10m data and your input is 1m, use 0.1.
 # If your input is already at the target resolution, use 1.0.
-SCALE_FACTOR = 1 
+SCALE_FACTOR = 0.1 
 
 # 3. SYNTHETIC NIR
 # Set to True ONLY if you are using RGB data and need to fake the NIR band.
 GENERATE_SYNTHETIC_NIR = False 
-
-# ------------------------------------------------------------------------------
-# 7. Model Library & Compilation Config (v1.7.0+)
-# ------------------------------------------------------------------------------
-MODEL_CONFIG = {
-    "v4": {
-        "model_library": "smp",
-        "models": ["tu-regnety_004", "tu-edgenext_small"],
-        "weight_format": ".safetensors"
-    },
-    "v3": {
-        "model_library": "fastai",
-        "models": ["regnety_004", "edgenext_small"],
-        "weight_format": ".safetensors"
-    },
-    "v2": {
-        "model_library": "fastai",
-        "models": ["regnety_004", "edgenext_small"],
-        "weight_format": ".safetensors"
-    },
-    "v1": {
-        "model_library": "fastai",
-        "models": ["regnety_004", "convnextv2_nano"],
-        "weight_format": ".pth"
-    }
-}
-
-INFERENCE_CONFIG = {
-    "compile_models": False,  # Set to True for production
-    "compile_mode": "default",
-    "inference_dtype": "float32"
-}

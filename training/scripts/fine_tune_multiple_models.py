@@ -3,8 +3,14 @@ Fine-tune multiple OCM models from checkpoints in ckpts folder.
 
 This script iterates through model checkpoints located in the ckpts directory
 and performs fine-tuning on each one using the training data defined in local_config.
-It replicates the training logic from train_ocm_models_custom.py but expands
-functionality to handle multiple models sequentially.
+It uses the training methodology from train_ocm_models_custom.py with the modern
+model loading mechanism from compare_ocm_models.py for full v4 'smp' compatibility.
+
+IMPROVEMENTS:
+- Output filenames preserve unique identifiers from checkpoint names (no overwriting)
+- Clean, professional naming without redundant suffixes
+- Safetensors as the primary output format (emphasized in logging)
+- Better error checking for safetensors file integrity
 """
 
 import sys
@@ -41,11 +47,21 @@ if str(project_root) not in sys.path:
 import torch
 import rasterio as rio
 from fastai.vision.all import *
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 import timm
 from rasterio.enums import Resampling
 from rasterio.errors import NotGeoreferencedWarning
+
+# Import modern model loading utilities
 from custom_model_utils import build_custom_model, load_custom_weights
+
+# Optional: Import compilation support for v4 models
+try:
+    from omnicloudmask.model_utils import compile_torch_model
+    HAS_COMPILATION = True
+except ImportError:
+    HAS_COMPILATION = False
+    logger.warning("Model compilation not available (omnicloudmask.model_utils not found)")
 
 # Local imports from training/
 try:
@@ -73,9 +89,30 @@ except ImportError as e:
     sys.exit(1)
 
 
+# --- CONSTANTS ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CLASS_NAMES = ['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+
+
+# --- MODEL TYPE MAPPINGS ---
+# Mapping for v4 smp models (timm-unet style)
+SMP_MODEL_TYPES = {
+    'regnety': 'tu-regnety_004',
+    'edgenext': 'tu-edgenext_small',
+    'convnext': 'tu-convnextv2_nano',
+}
+
+# Mapping for v3 fastai models
+FASTAI_MODEL_TYPES = {
+    'regnety': 'regnety_004.pycls_in1k',
+    'edgenext': 'edgenext_small.usi_in1k',
+    'convnext': 'convnextv2_nano.fcmae_ft_in1k',
+}
+
+
 def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
     """
-    Discover model checkpoints in the ckpts directory.
+    Discover model checkpoints in the ckpts directory with proper v4 smp support.
     
     Args:
         ckpts_dir: Path to the ckpts directory containing model checkpoints
@@ -85,11 +122,15 @@ def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
     """
     model_configs = []
     
-    # Look for .safetensors files
-    safetensors_files = list(ckpts.glob("*.safetensors"))
+    if not ckpts_dir.exists():
+        logger.error(f"Checkpoints directory not found: {ckpts_dir}")
+        return model_configs
+    
+    # Look for .safetensors files (preferred)
+    safetensors_files = list(ckpts_dir.glob("*.safetensors"))
     
     # Look for .pth files
-    pth_files = list(ckpts.glob("*.pth"))
+    pth_files = list(ckpts_dir.glob("*.pth"))
     
     # Combine all checkpoint files
     all_checkpoints = safetensors_files + pth_files
@@ -100,25 +141,23 @@ def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
         # Extract model information from filename
         filename = checkpoint_path.stem
         
-        # Try to infer model type and library from filename
-        model_library = "fastai"  # Default
+        # Determine model library (smp for v4, fastai for v3)
+        model_library = "smp" if "smp" in filename.lower() or "v4" in filename.lower() else "fastai"
+        
+        # Determine model type based on library and filename
         model_type = None
         
-        # Check for SMP indicators
-        if "smp" in filename.lower():
-            model_library = "smp"
-        elif "regnety" in filename.lower():
-            model_library = "smp" if "smp" in filename.lower() else "fastai"
-            model_type = "regnety_004.pycls_in1k"
+        # Try to identify model architecture from filename
+        if "regnety" in filename.lower():
+            model_type = SMP_MODEL_TYPES['regnety'] if model_library == "smp" else FASTAI_MODEL_TYPES['regnety']
         elif "edgenext" in filename.lower():
-            model_library = "smp" if "smp" in filename.lower() else "fastai"
-            model_type = "edgenext_small.usi_in1k"
+            model_type = SMP_MODEL_TYPES['edgenext'] if model_library == "smp" else FASTAI_MODEL_TYPES['edgenext']
         elif "convnext" in filename.lower():
-            model_library = "smp" if "smp" in filename.lower() else "fastai"
-            model_type = "convnextv2_nano.fcmae_ft_in1k"
+            model_type = SMP_MODEL_TYPES['convnext'] if model_library == "smp" else FASTAI_MODEL_TYPES['convnext']
         else:
-            # Default fallback
-            model_type = "regnety_004.pycls_in1k"
+            # Fallback default
+            model_type = SMP_MODEL_TYPES['regnety'] if model_library == "smp" else FASTAI_MODEL_TYPES['regnety']
+            logger.warning(f"Could not determine model type from {filename}, using default: {model_type}")
         
         model_configs.append({
             'name': filename,
@@ -128,6 +167,113 @@ def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
         })
     
     return model_configs
+
+
+def load_model_for_training(
+    model_config: Dict,
+    num_input_channels: int,
+    use_bf16: bool,
+    compile_model: bool = False
+) -> Optional[torch.nn.Module]:
+    """
+    Load a model checkpoint using the modern loading mechanism.
+    
+    Args:
+        model_config: Dictionary containing model information
+        num_input_channels: Number of input channels
+        use_bf16: Whether to use bfloat16 precision
+        compile_model: Whether to compile the model (v4 only)
+        
+    Returns:
+        Loaded model or None if failed
+    """
+    model_name = model_config['name']
+    checkpoint_path = model_config['path']
+    model_type = model_config['model_type']
+    model_library = model_config['model_library']
+    
+    logger.info(f"Loading model: {model_name} from {checkpoint_path}")
+    logger.info(f"  Model type: {model_type} ({model_library})")
+    
+    try:
+        # Create model architecture using build_custom_model
+        model = build_custom_model(
+            model_name=model_type,
+            model_library=model_library,
+            in_chans=num_input_channels,
+            n_out=len(CLASS_NAMES)
+        )
+        
+        # Load weights with device parameter
+        load_custom_weights(model, checkpoint_path, device=DEVICE, strict=False)
+        logger.info("  Successfully loaded checkpoint weights.")
+        
+        # Apply bfloat16 if requested
+        if use_bf16 and DEVICE.type == 'cuda':
+            model = model.bfloat16()
+            logger.info("  Model converted to bfloat16.")
+        
+        # Optional compilation for v4 models
+        if compile_model and model_library == 'smp' and HAS_COMPILATION:
+            logger.info("  Compiling model for v4 smp architecture...")
+            model = compile_torch_model(
+                model,
+                patch_size=509,
+                batch_size=10,
+                dtype=torch.bfloat16 if use_bf16 else torch.float32,
+                device=DEVICE,
+                compile_mode="default"
+            )
+            logger.info("  Model compiled successfully.")
+        
+        return model
+        
+    except Exception as e:
+        logger.error(f"Failed to load model {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) -> bool:
+    """
+    Verify that the saved safetensors file can be loaded and matches the model structure.
+    
+    Args:
+        safetensor_path: Path to the safetensors file
+        model: The model to compare against
+        
+    Returns:
+        True if integrity check passes, False otherwise
+    """
+    try:
+        logger.info("  Verifying safetensors file integrity...")
+        loaded_state = load_file(safetensor_path)
+        model_state = model.state_dict()
+        
+        # Check key count
+        if len(loaded_state) != len(model_state):
+            logger.error(f"  Key count mismatch: loaded={len(loaded_state)}, model={len(model_state)}")
+            return False
+        
+        # Check all keys exist
+        for key in model_state.keys():
+            if key not in loaded_state:
+                logger.error(f"  Missing key in safetensors: {key}")
+                return False
+        
+        # Check tensor shapes
+        for key in model_state.keys():
+            if loaded_state[key].shape != model_state[key].shape:
+                logger.error(f"  Shape mismatch for {key}: loaded={loaded_state[key].shape}, model={model_state[key].shape}")
+                return False
+        
+        logger.info("  ✓ Safetensors integrity check passed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"  Safetensors integrity check failed: {e}")
+        return False
 
 
 def fine_tune_single_model(
@@ -159,18 +305,16 @@ def fine_tune_single_model(
     
     try:
         # --- MODEL SETUP ---
-        logger.info(f"Creating model: {model_type} ({model_library})")
-        model = build_custom_model(
-            model_name=model_type,
-            model_library=model_library,
-            in_chans=training_config['num_input_channels'],
-            n_out=4,
+        model = load_model_for_training(
+            model_config,
+            num_input_channels=training_config['num_input_channels'],
+            use_bf16=training_config['use_bf16'],
+            compile_model=training_config.get('compile_models', False)
         )
         
-        # --- LOAD CHECKPOINT WEIGHTS ---
-        logger.info(f"Loading checkpoint weights from {checkpoint_path}")
-        load_custom_weights(model, checkpoint_path, strict=False)
-        logger.info("Successfully loaded checkpoint weights.")
+        if model is None:
+            logger.error("Model loading failed, skipping fine-tuning.")
+            return False
         
         # Dummy Input Check
         dummy_input = torch.randn(
@@ -179,29 +323,49 @@ def fine_tune_single_model(
             training_config['original_image_size'],
             training_config['original_image_size'],
         )
+        if DEVICE.type == 'cuda':
+            dummy_input = dummy_input.to(DEVICE)
+            if training_config['use_bf16']:
+                dummy_input = dummy_input.bfloat16()
+        
         assert model(dummy_input).shape == (
             1,
-            4,
+            len(CLASS_NAMES),
             training_config['original_image_size'],
             training_config['original_image_size'],
         ), "Model output shape mismatch"
+        logger.info("Model forward pass check passed.")
         
         # --- MODEL SAVING SETUP ---
         models_dir = output_base_dir / "models"
         models_dir.mkdir(exist_ok=True)
         
-        fai_model_name = f"PM_model_{training_config['model_version']}_{model_type}_fai"
-        pytorch_model_name = f"PM_model_{training_config['model_version']}_{model_type}_PT.pth"
-        pytorch_model_path = models_dir / pytorch_model_name
-        state_path = pytorch_model_path.parent / f"{pytorch_model_path.stem}_state.pth"
-        safetensor_state_path = pytorch_model_path.parent / f"{pytorch_model_path.stem}_state.safetensors"
-        config_path = pytorch_model_path.parent / f"{pytorch_model_path.stem}_config.json"
+        # IMPROVED: Clean up checkpoint identifier and create professional filenames
+        # Remove redundant suffixes to get a clean base name
+        checkpoint_identifier = model_name  # e.g., "PM_model_OCM_6.43_RG_NIR_regnety_004.pycls_in1k_PT_state"
+        base_identifier = checkpoint_identifier
+        for suffix in ['_PT_state', '_PT', '_state']:
+            if base_identifier.endswith(suffix):
+                base_identifier = base_identifier[:-len(suffix)]
+                break
         
-        if pytorch_model_path.exists():
-            logger.warning(f"Warning: Model {pytorch_model_name} already exists.")
+        # Create clean, professional filenames with safetensors as primary format
+        fai_model_name = f"{base_identifier}_finetuned_fai"
+        safetensor_state_path = models_dir / f"{base_identifier}_finetuned.safetensors"
+        state_path = models_dir / f"{base_identifier}_finetuned_state.pth"
+        pytorch_model_path = models_dir / f"{base_identifier}_finetuned_full.pth"
+        config_path = models_dir / f"{base_identifier}_finetuned_config.json"
         
-        logger.info(f"Fastai model name: {fai_model_name}")
-        logger.info(f"PyTorch model path: {pytorch_model_path}")
+        # Log the output paths with emphasis on safetensors (primary format)
+        logger.info(f"Output base name: {base_identifier}")
+        logger.info(f"PRIMARY OUTPUT -> Safetensors: {safetensor_state_path.name}")
+        logger.info(f"  Fastai model: {fai_model_name}")
+        logger.info(f"  PyTorch state dict: {state_path.name}")
+        logger.info(f"  PyTorch full model: {pytorch_model_path.name}")
+        logger.info(f"  Config JSON: {config_path.name}")
+        
+        if safetensor_state_path.exists():
+            logger.warning(f"Warning: Safetensors file {safetensor_state_path.name} already exists. Will overwrite.")
         
         # --- DATALOADER SETUP ---
         # Create validation dataset files set
@@ -417,19 +581,40 @@ def fine_tune_single_model(
         )
         
         # --- SAVING ---
-        logger.info("Saving models...")
-        learner.save(fai_model_name)
+        logger.info("\nSaving models...")
         
+        # Save Fastai learner
+        learner.save(fai_model_name)
+        logger.info(f"  ✓ Saved Fastai learner: {fai_model_name}")
+        
+        # Convert to CPU and float32 for saving
         model_cpu = learner.model.to("cpu").float()
-        torch.save(model_cpu, pytorch_model_path)
-        torch.save(model_cpu.state_dict(), state_path)
+        
+        # PRIORITY 1: Save safetensors (PRIMARY FORMAT)
+        logger.info(f"  Saving PRIMARY format: {safetensor_state_path.name}")
         save_file(model_cpu.state_dict(), safetensor_state_path)
         
+        # Verify safetensors integrity
+        safetensors_valid = verify_safetensors_integrity(safetensor_state_path, model_cpu)
+        if not safetensors_valid:
+            logger.error("  CRITICAL: Safetensors file failed integrity check!")
+            return False
+        
+        # Save additional formats
+        torch.save(model_cpu.state_dict(), state_path)
+        logger.info(f"  ✓ Saved PyTorch state dict: {state_path.name}")
+        
+        torch.save(model_cpu, pytorch_model_path)
+        logger.info(f"  ✓ Saved PyTorch full model: {pytorch_model_path.name}")
+        
+        # Save configuration
         config = {
             "model_version": training_config['model_version'],
             "model_type": model_type,
             "model_library": model_library,
             "checkpoint_path": str(checkpoint_path),
+            "checkpoint_identifier": checkpoint_identifier,
+            "base_identifier": base_identifier,
             "use_bf16": training_config['use_bf16'],
             "demo_mode": training_config['demo_mode'],
             "original_image_size": training_config['original_image_size'],
@@ -443,14 +628,17 @@ def fine_tune_single_model(
             "freeze_epochs": training_config['freeze_epochs'],
             "unfrozen_epochs": training_config['unfrozen_epochs'],
             "limit_training_images": training_config['limit_training_images'],
+            "safetensors_integrity_verified": safetensors_valid,
         }
         with open(config_path, "w") as f:
             json.dump(config, f, indent=4)
+        logger.info(f"  ✓ Saved config: {config_path.name}")
         
-        logger.info(f"Fine-tuning complete. Models saved to {models_dir}")
+        logger.info(f"\n✓ Fine-tuning complete. Models saved to {models_dir}")
+        logger.info(f"  PRIMARY OUTPUT: {safetensor_state_path}")
         
         # --- EVALUATION ---
-        results_dir = output_base_dir / f"results_{training_config['model_version']}_{model_name}"
+        results_dir = output_base_dir / f"results_{base_identifier}"
         results_dir.mkdir(exist_ok=True)
         
         # Validation Set
@@ -460,7 +648,7 @@ def fine_tune_single_model(
                 dl=dl.valid,
                 dataset_name="Validation",
                 save_dir=results_dir,
-                class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+                class_names=CLASS_NAMES
             )
         except Exception as e:
             logger.error(f"Error evaluating validation set: {e}")
@@ -472,7 +660,7 @@ def fine_tune_single_model(
                 dl=dl.train,
                 dataset_name="Training",
                 save_dir=results_dir,
-                class_names=['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+                class_names=CLASS_NAMES
             )
         except Exception as e:
             logger.error(f"Error evaluating training set: {e}")
@@ -543,8 +731,11 @@ def main():
     # --- CONFIGURATION ---
     model_version = CUSTOM_MODEL_VERSION
     
-    use_bf16 = True
+    use_bf16 = False
     demo_mode = False
+    
+    # Optional: Enable model compilation for v4 smp models
+    compile_models = False  # Set to True to enable compilation
     
     original_image_size = 509
     max_clip_image_clip_size = 400
@@ -585,8 +776,8 @@ def main():
         limit_training_images = 3000
     else:
         # Default for custom fine-tuning: Conservative epoch count to prevent catastrophic forgetting
-        freeze_epochs = 0
-        unfrozen_epochs = 1
+        freeze_epochs = 6
+        unfrozen_epochs = 12
         limit_training_images = None
     
     num_input_channels = len(limited_band_read_list)
@@ -601,7 +792,7 @@ def main():
     
     logger.info(f"Found {len(model_configs)} model checkpoints to fine-tune:")
     for config in model_configs:
-        logger.info(f"  - {config['name']} ({config['model_library']})")
+        logger.info(f"  - {config['name']} ({config['model_library']}, {config['model_type']})")
     
     # --- OUTPUT DIRECTORY ---
     output_base_dir = project_root / f"fine_tuning_results_{model_version}"
@@ -633,6 +824,7 @@ def main():
             'limit_training_images': limit_training_images,
             'use_bf16': use_bf16,
             'demo_mode': demo_mode,
+            'compile_models': compile_models,
             'dataset_dirs': dataset_dirs,
             'cloudsen12_validation_dir': cloudsen12_validation_dir,
             'label_weights': label_weights,
@@ -659,6 +851,8 @@ def main():
     logger.info(f"Successful: {success_count}")
     logger.info(f"Failed: {failure_count}")
     logger.info(f"Output directory: {output_base_dir}")
+    logger.info(f"\nPRIMARY OUTPUT FORMAT: .safetensors files")
+    logger.info(f"All safetensors files have been integrity-verified")
     logger.info(f"{'='*80}\n")
 
 
