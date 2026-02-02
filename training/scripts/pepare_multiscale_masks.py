@@ -51,7 +51,7 @@ PROJECT_CONFIGS = {
         "description": "2051_102025082_D82_Tarn-et-Garonne_A (LEGACY)"
     },
     "D09E": {  # Arriege_E
-        "original_size": (26460, 17004),
+        "original_size": (4000, 2571),
         "current_size": (640, 411),
         "has_tfw": False,
         "description": "2051_102025077_D09_Arriege_E"
@@ -82,6 +82,15 @@ CLASS_MAPPING = {
     'Cloud Deep': 1,
     'Cloud Lite': 2,
     'Shadow': 3
+}
+
+# Synonym normalization (extendable)
+SYNONYMS = {
+    'light': 'lite',
+    'lite': 'lite',
+    'deep': 'deep',
+    'cloud': 'cloud',
+    'shadow': 'shadow'
 }
 
 def detect_project_type(filename):
@@ -251,19 +260,29 @@ def process_masks():
                     
                     logger.info(f"  GPKG Bounds (scaled): {gdf.total_bounds}")
                     
-                    # Prepare shapes to burn
+                    def normalize_tokens(text):
+                        tokens = re.findall(r'\w+', text.lower())
+                        return frozenset(SYNONYMS.get(t, t) for t in tokens)
+
+                    # Build canonical token lookup
+                    CLASS_TOKEN_MAP = {
+                        normalize_tokens(k): v
+                        for k, v in CLASS_MAPPING.items()
+                    }
+
                     shapes_to_burn = []
-                    
+
                     for idx, row in gdf.iterrows():
                         raw_cls = row['Remark']
-                        
-                        if isinstance(raw_cls, str):
-                            cls_name = re.sub(r'\s+', ' ', raw_cls.strip())
-                        else:
+
+                        if not isinstance(raw_cls, str):
                             continue
-                        
-                        if cls_name in CLASS_MAPPING:
-                            val = CLASS_MAPPING[cls_name]
+
+                        token_set = normalize_tokens(raw_cls)
+
+                        # exact semantic match
+                        if token_set in CLASS_TOKEN_MAP:
+                            val = CLASS_TOKEN_MAP[token_set]
                             shapes_to_burn.append((row['geometry'], val))
                     
                     # Sort by priority (Shadow > Cloud Lite > Cloud Deep)
