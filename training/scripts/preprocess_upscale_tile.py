@@ -117,10 +117,11 @@ def preprocess_images():
     # Create output directories
     (OUTPUT_DIR / "train").mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "validation").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "test").mkdir(parents=True, exist_ok=True)
     
     # Find all images
     image_files = []
-    for ext in ['*.tif', '*.tiff', '*.jpg', '*.jpeg', '*.png']:
+    for ext in ['*.tif', '*.tiff', '*.jpg', '*.jpeg', '*.png', '*.iiq']:
         image_files.extend(INPUT_IMAGES_DIR.glob(ext))
     
     logger.info(f"Found {len(image_files)} images to process.")
@@ -129,6 +130,7 @@ def preprocess_images():
         "total": 0,
         "train": 0,
         "validation": 0,
+        "test": 0,
         "skipped": 0,
         "total_tiles": 0
     }
@@ -277,12 +279,17 @@ def preprocess_images():
                         if tile_img.max() == 0:
                             continue
                         
-                        # Randomly assign to train (80%) or validation (20%)
-                        split_dir = "validation" if np.random.rand() < 0.2 else "train"
-                        if split_dir == "train":
+                        # Randomly assign to train (60%), validation (20%), or test (20%)
+                        rand_val = np.random.rand()
+                        if rand_val < 0.7:
+                            split_dir = "train"
                             stats["train"] += 1
-                        else:
+                        elif rand_val < 0.85:
+                            split_dir = "validation"
                             stats["validation"] += 1
+                        else:
+                            split_dir = "test"
+                            stats["test"] += 1
                         
                         base_name = f"{img_path.stem}_tile_{row}_{col}"
                         
@@ -342,6 +349,7 @@ def preprocess_images():
     logger.info(f"Total tiles generated: {stats['total_tiles']}")
     logger.info(f"  Train: {stats['train']}")
     logger.info(f"  Validation: {stats['validation']}")
+    logger.info(f"  Test: {stats['test']}")
     logger.info(f"\nOutput directory: {OUTPUT_DIR}")
     logger.info("="*80)
 

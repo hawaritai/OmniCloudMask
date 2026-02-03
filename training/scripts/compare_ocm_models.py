@@ -81,7 +81,7 @@ try:
         COMPARISON_QUICK_TEST = True
         COMPARISON_QUICK_TEST_SAMPLES = 50
         COMPARISON_BATCH_SIZE = 8
-        COMPARISON_USE_BF16 = True
+        COMPARISON_USE_BF16 = False
         MODEL_CONFIG = {
             "v4": {"model_library": "smp"},
             "v3": {"model_library": "fastai"}
@@ -169,7 +169,7 @@ def safe_file_save(
             save_func(*args, **kwargs)
             
             if attempt > 0:
-                logger.info(f"    ✓ {operation_name} succeeded on attempt {attempt + 1}/{max_retries}")
+                logger.info(f"     {operation_name} succeeded on attempt {attempt + 1}/{max_retries}")
             return True
             
         except OSError as e:
@@ -187,15 +187,15 @@ def safe_file_save(
                     continue
                 else:
                     # No more retries
-                    logger.error(f"    ✗ {operation_name} failed after {max_retries} attempts: {e}")
+                    logger.error(f"     {operation_name} failed after {max_retries} attempts: {e}")
                     return False
             else:
                 # Different OS error, don't retry
-                logger.error(f"    ✗ {operation_name} failed: {e}")
+                logger.error(f"     {operation_name} failed: {e}")
                 return False
         
         except Exception as e:
-            logger.error(f"    ✗ {operation_name} failed with unexpected error: {e}")
+            logger.error(f"     {operation_name} failed with unexpected error: {e}")
             return False
     
     return False
@@ -218,13 +218,18 @@ def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
         return model_configs
     
     # Look for .safetensors files (preferred)
-    safetensors_files = list(ckpts_dir.glob("*.safetensors"))
+    try:
+        safetensors_files = list(ckpts_dir.glob("*best.safetensors"))
+        if len(safetensors_files) == 0:
+            safetensors_files = list(ckpts_dir.glob("*.safetensors"))
+    except Exception as e:
+        safetensors_files = list(ckpts_dir.glob("*.safetensors"))
     
-    # Look for .pth files
-    pth_files = list(ckpts_dir.glob("*.pth"))
+    # # Look for .pth files
+    # pth_files = list(ckpts_dir.glob("*.pth"))
     
     # Combine all checkpoint files
-    all_checkpoints = safetensors_files + pth_files
+    all_checkpoints = safetensors_files #+ pth_files
     
     logger.info(f"Found {len(all_checkpoints)} checkpoint files in {ckpts_dir}")
     
@@ -293,7 +298,7 @@ def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) 
                 logger.error(f"  Shape mismatch for {key}: loaded={loaded_state[key].shape}, model={model_state[key].shape}")
                 return False
         
-        logger.info("  ✓ Safetensors integrity check passed")
+        logger.info("   Safetensors integrity check passed")
         return True
         
     except Exception as e:
@@ -306,9 +311,14 @@ def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) 
 model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
-models_dir = project_root / "ckpts"
-if models_dir.exists():
-    discovered_models = discover_model_checkpoints(models_dir)
+# models_dir = project_root / "ckpts"
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v6\models")
+bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
+
+if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
+    discovered_fined_tuned_models = discover_model_checkpoints(fine_tuned_models_dir)
+    discovered_models = discover_model_checkpoints(bsae_model_dir)
+    model_configs.extend(discovered_fined_tuned_models)
     model_configs.extend(discovered_models)
 
 # Optional: Add additional manual model configurations
@@ -806,7 +816,7 @@ class ModelComparator:
             plt.tight_layout()
             plt.savefig(self.plots_dir / 'metrics_comparison.png')
             plt.close()
-            logger.info("  ✓ Saved metrics comparison plot")
+            logger.info("   Saved metrics comparison plot")
             
             # 2. Per-Class F1 Score Comparison
             class_rows = []
@@ -832,7 +842,7 @@ class ModelComparator:
                 plt.tight_layout()
                 plt.savefig(self.plots_dir / 'per_class_f1.png')
                 plt.close()
-                logger.info("  ✓ Saved per-class F1 plot")
+                logger.info("   Saved per-class F1 plot")
                 
                 plt.figure(figsize=(14, 6))
                 sns.barplot(data=df_cls, x='Class', y='IoU', hue='Model')
@@ -842,45 +852,59 @@ class ModelComparator:
                 plt.tight_layout()
                 plt.savefig(self.plots_dir / 'per_class_iou.png')
                 plt.close()
-                logger.info("  ✓ Saved per-class IoU plot")
+                logger.info("   Saved per-class IoU plot")
 
             # 3. Confusion Matrices
             num_models = len(all_metrics)
             if num_models > 0:
-                fig, axes = plt.subplots(1, num_models, figsize=(6 * num_models, 5))
-                if num_models == 1: axes = [axes]
+                # Use grid layout (columns of 4) for better visibility with 4+ models
+                n_cols = min(4, num_models)
+                n_rows = (num_models + n_cols - 1) // n_cols
                 
-                for ax, (model_name, m) in zip(axes, all_metrics.items()):
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+                axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
+                
+                for idx, (model_name, m) in enumerate(all_metrics.items()):
+                    ax = axes[idx]
                     cm = np.array(m.get('confusion_matrix', []))
                     if cm.size > 0:
                         sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', 
                                     xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax, vmin=0, vmax=1)
-                        ax.set_title(f'Confusion Matrix: {model_name}')
+                        ax.set_title(f'{model_name}')
                         ax.set_ylabel('True Label')
                         ax.set_xlabel('Predicted Label')
+                
+                # Hide unused subplots
+                for idx in range(num_models, len(axes)):
+                    fig.delaxes(axes[idx])
                 
                 plt.tight_layout()
                 plt.savefig(self.plots_dir / 'confusion_matrices.png')
                 plt.close()
-                logger.info("  ✓ Saved confusion matrices plot")
+                logger.info("   Saved confusion matrices plot")
                 
                 # 3b. Raw Confusion Matrices (for detailed analysis)
-                fig, axes = plt.subplots(1, num_models, figsize=(6 * num_models, 5))
-                if num_models == 1: axes = [axes]
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+                axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
                 
-                for ax, (model_name, m) in zip(axes, all_metrics.items()):
+                for idx, (model_name, m) in enumerate(all_metrics.items()):
+                    ax = axes[idx]
                     cm_raw = np.array(m.get('confusion_matrix_raw', []))
                     if cm_raw.size > 0:
                         sns.heatmap(cm_raw, annot=True, fmt='d', cmap='Blues',
                                     xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
-                        ax.set_title(f'Raw Confusion Matrix: {model_name}')
+                        ax.set_title(f'{model_name}')
                         ax.set_ylabel('True Label')
                         ax.set_xlabel('Predicted Label')
+                
+                # Hide unused subplots
+                for idx in range(num_models, len(axes)):
+                    fig.delaxes(axes[idx])
                 
                 plt.tight_layout()
                 plt.savefig(self.plots_dir / 'confusion_matrices_raw.png')
                 plt.close()
-                logger.info("  ✓ Saved raw confusion matrices plot")
+                logger.info("   Saved raw confusion matrices plot")
                 
                 # 4. PR Curves
                 fig, axes = plt.subplots(1, len(CLASS_NAMES), figsize=(6 * len(CLASS_NAMES), 5))
@@ -904,7 +928,7 @@ class ModelComparator:
                 plt.tight_layout()
                 plt.savefig(self.plots_dir / 'pr_curves.png')
                 plt.close()
-                logger.info("  ✓ Saved PR curves plot")
+                logger.info("   Saved PR curves plot")
             
         except Exception as e:
             logger.error(f"Error generating comparison plots: {e}")
@@ -936,7 +960,7 @@ class ModelComparator:
             model = self.load_model(config)
             if model is None:
                 failure_count += 1
-                logger.error(f"✗ Failed to load model {config['name']}")
+                logger.error(f" Failed to load model {config['name']}")
                 continue
             
             try:
@@ -944,7 +968,7 @@ class ModelComparator:
                 
                 if y_pred is None or y_true is None or y_probs is None:
                     failure_count += 1
-                    logger.error(f"✗ Failed to evaluate model {config['name']}")
+                    logger.error(f" Failed to evaluate model {config['name']}")
                     del model
                     torch.cuda.empty_cache() if torch.cuda.is_available() else None
                     gc.collect()
@@ -965,7 +989,7 @@ class ModelComparator:
                 )
                 
                 if success:
-                    logger.info(f"✓ Successfully evaluated {config['name']}")
+                    logger.info(f" Successfully evaluated {config['name']}")
                     logger.info(f"  Accuracy: {metrics['Accuracy']:.4f}")
                     logger.info(f"  Mean IoU: {metrics['Mean_IoU']:.4f}")
                     logger.info(f"  Mean F1: {metrics['Mean_F1']:.4f}")
@@ -974,7 +998,7 @@ class ModelComparator:
                     success_count += 1
                 else:
                     failure_count += 1
-                    logger.error(f"✗ Failed to save metrics for {config['name']}")
+                    logger.error(f" Failed to save metrics for {config['name']}")
                 
                 # Clear memory
                 del model, y_pred, y_true, y_probs, metrics
@@ -983,7 +1007,7 @@ class ModelComparator:
                 
             except Exception as e:
                 failure_count += 1
-                logger.error(f"✗ Error during evaluation of {config['name']}: {e}")
+                logger.error(f" Error during evaluation of {config['name']}: {e}")
                 import traceback
                 traceback.print_exc()
                 # Clear memory on error
@@ -1050,9 +1074,9 @@ class ModelComparator:
             )
             
             if success:
-                logger.info(f"  ✓ Saved summary metrics: {summary_path.name}")
+                logger.info(f"   Saved summary metrics: {summary_path.name}")
             else:
-                logger.error(f"  ✗ Failed to save summary metrics")
+                logger.error(f"   Failed to save summary metrics")
                 
         except Exception as e:
             logger.error(f"Error creating summary table: {e}")

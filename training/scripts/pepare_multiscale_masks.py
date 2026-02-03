@@ -102,7 +102,7 @@ def detect_project_type(filename):
         25FD0905Ex07650_07650.tif -> D09E
         25FD0905Dx_40007_008715.tif -> D09D
         08048-qvRGB.jpg -> FHSTG
-        __199002098_0053_01_0191_P00_01.iiq -> PHKIO
+        199002098_0053_01_0191_P00_01.iiq -> PHKIO
     """
     filename = str(filename)
     
@@ -120,8 +120,8 @@ def detect_project_type(filename):
     if "qvRGB" in filename:
         return "FHSTG"
     
-    # Pattern for PHKIO: starts with "__" and contains .iiq
-    if filename.startswith("__") and ".iiq" in filename:
+    # Pattern for PHKIO: contains .iiq
+    if ".iiq" in filename:
         return "PHKIO"
     
     # Default: Could not detect

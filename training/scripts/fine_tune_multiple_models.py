@@ -6,13 +6,24 @@ and performs fine-tuning on each one using the training data defined in local_co
 It uses the training methodology from train_ocm_models_custom.py with the modern
 model loading mechanism from compare_ocm_models.py for full v4 'smp' compatibility.
 
+RECALL-FOCUSED TRAINING STRATEGY:
+- Primary goal: Minimize false negatives (critical for application)
+- Metric weighting: 30% Dice + 70% Recall (prioritizes recall)
+- Class weights: [Clear=0.5, Thick Cloud=2.0, Thin Cloud=3.0, Cloud Shadow=3.0]
+- Critical classes: Thin Cloud and Cloud Shadow (highest priority)
+- Leniency: Thin Cloud can be detected as Thick Cloud, but NO leniency for Cloud Shadow
+- Model selection: Based on composite score (30% Dice + 70% Recall)
+- Early stopping: Monitors recall_multi_strip with patience=5
+- Logging: Per-class metrics tracked via MetricLogger callback
+
 IMPROVEMENTS:
 - Output filenames preserve unique identifiers from checkpoint names (no overwriting)
 - Clean, professional naming without redundant suffixes
 - Safetensors as the primary output format (emphasized in logging)
 - Better error checking for safetensors file integrity
 - Automatic best model tracking: Saves both best and latest models during training
-  - Best model is selected based on dice_multi_strip metric (higher is better)
+  - Best model is selected based on composite_score metric (higher is better)
+  - Composite score = 0.3 * dice_multi_strip + 0.7 * recall_multi_strip
   - Prevents overfitting by preserving the best performing model
   - Both models are saved in safetensors and fastai learner formats
 - FIXED: Windows file locking issues with proper cleanup and retry logic
@@ -53,7 +64,7 @@ if str(project_root) not in sys.path:
 # --- IMPORTS ---
 import torch
 import rasterio as rio
-from fastai.vision.all import *
+from fastai.vision.all import *  # This includes store_attr
 from safetensors.torch import save_file, load_file
 import timm
 from rasterio.enums import Resampling
@@ -86,7 +97,18 @@ try:
     )
     from utils import (
         DiceMultiStrip,
+        RecallMultiStrip,
         CrossEntropyLossFlatImageTypeWeighted,
+        EarlyStoppingRecall,
+        MetricLogger,
+        # Import utility functions and callbacks from utils.py
+        safe_file_save,
+        verify_safetensors_integrity,
+        CompositeMetricCallback,
+        ReduceLROnPlateauCustom,
+        SaveBestAndLatestModel,
+        MAX_SAVE_RETRIES,
+        SAVE_RETRY_DELAY,
     )
     from helpers import plot_batch, show_histo, print_system_info
     from eval_utils import compute_and_plot_metrics
@@ -99,8 +121,7 @@ except ImportError as e:
 # --- CONSTANTS ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLASS_NAMES = ['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
-MAX_SAVE_RETRIES = 3  # Maximum retry attempts for file operations
-SAVE_RETRY_DELAY = 0.5  # Delay between retries in seconds
+# Note: MAX_SAVE_RETRIES and SAVE_RETRY_DELAY are now imported from utils.py
 
 
 # --- MODEL TYPE MAPPINGS ---
@@ -117,73 +138,6 @@ FASTAI_MODEL_TYPES = {
     'edgenext': 'edgenext_small.usi_in1k',
     'convnext': 'convnextv2_nano.fcmae_ft_in1k',
 }
-
-
-def safe_file_save(
-    save_func,
-    *args,
-    operation_name: str = "file save",
-    max_retries: int = MAX_SAVE_RETRIES,
-    retry_delay: float = SAVE_RETRY_DELAY,
-    **kwargs
-) -> bool:
-    """
-    Safely save a file with retry logic for Windows file locking issues.
-    
-    Args:
-        save_func: Function to call for saving (e.g., save_file, torch.save)
-        *args: Positional arguments for save_func
-        operation_name: Description of operation for logging
-        max_retries: Maximum number of retry attempts
-        retry_delay: Delay between retries in seconds
-        **kwargs: Keyword arguments for save_func
-        
-    Returns:
-        True if save was successful, False otherwise
-    """
-    for attempt in range(max_retries):
-        try:
-            # Force garbage collection before save
-            gc.collect()
-            
-            # Small delay before save to allow file system to settle
-            if attempt > 0:
-                time.sleep(retry_delay * (attempt + 1))
-            
-            # Attempt the save
-            save_func(*args, **kwargs)
-            
-            if attempt > 0:
-                logger.info(f"    ✓ {operation_name} succeeded on attempt {attempt + 1}/{max_retries}")
-            return True
-            
-        except OSError as e:
-            error_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
-            
-            # Error 1224: The requested operation cannot be performed on a file with a user-mapped section open
-            # This is a Windows-specific file locking issue
-            if error_code == 1224 or "user-mapped section" in str(e):
-                logger.warning(f"    File lock detected (attempt {attempt + 1}/{max_retries}): {error_code}")
-                
-                if attempt < max_retries - 1:
-                    # More retries available, try again
-                    logger.debug(f"    Retrying {operation_name} in {retry_delay * (attempt + 1):.2f}s...")
-                    time.sleep(retry_delay * (attempt + 1))
-                    continue
-                else:
-                    # No more retries
-                    logger.error(f"    ✗ {operation_name} failed after {max_retries} attempts: {e}")
-                    return False
-            else:
-                # Different OS error, don't retry
-                logger.error(f"    ✗ {operation_name} failed: {e}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"    ✗ {operation_name} failed with unexpected error: {e}")
-            return False
-    
-    return False
 
 
 def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
@@ -287,11 +241,11 @@ def load_model_for_training(
         # Apply bfloat16 if requested
         if use_bf16 and DEVICE.type == 'cuda':
             model = model.bfloat16()
-            logger.info("  Model converted to bfloat16.")
+            logger.debug("  Model converted to bfloat16.")
         
         # Optional compilation for v4 models
         if compile_model and model_library == 'smp' and HAS_COMPILATION:
-            logger.info("  Compiling model for v4 smp architecture...")
+            logger.debug("  Compiling model for v4 smp architecture...")
             model = compile_torch_model(
                 model,
                 patch_size=509,
@@ -300,7 +254,7 @@ def load_model_for_training(
                 device=DEVICE,
                 compile_mode="default"
             )
-            logger.info("  Model compiled successfully.")
+            logger.debug("  Model compiled successfully.")
         
         return model
         
@@ -309,362 +263,6 @@ def load_model_for_training(
         import traceback
         traceback.print_exc()
         return None
-
-
-def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) -> bool:
-    """
-    Verify that the saved safetensors file can be loaded and matches the model structure.
-    
-    Args:
-        safetensor_path: Path to the safetensors file
-        model: The model to compare against
-        
-    Returns:
-        True if integrity check passes, False otherwise
-    """
-    try:
-        logger.info("  Verifying safetensors file integrity...")
-        loaded_state = load_file(safetensor_path)
-        model_state = model.state_dict()
-        
-        # Check key count
-        if len(loaded_state) != len(model_state):
-            logger.error(f"  Key count mismatch: loaded={len(loaded_state)}, model={len(model_state)}")
-            return False
-        
-        # Check all keys exist
-        for key in model_state.keys():
-            if key not in loaded_state:
-                logger.error(f"  Missing key in safetensors: {key}")
-                return False
-        
-        # Check tensor shapes
-        for key in model_state.keys():
-            if loaded_state[key].shape != model_state[key].shape:
-                logger.error(f"  Shape mismatch for {key}: loaded={loaded_state[key].shape}, model={model_state[key].shape}")
-                return False
-        
-        logger.info("  ✓ Safetensors integrity check passed")
-        return True
-        
-    except Exception as e:
-        logger.error(f"  Safetensors integrity check failed: {e}")
-        return False
-
-
-class SaveBestAndLatestModel(Callback):
-    """
-    Custom callback to save the best model (based on dice_multi_strip metric)
-    and the latest model after each epoch.
-    
-    This callback monitors the dice_multi_strip metric and saves the model
-    when a better score is achieved. It also saves the latest model at the end
-    of training.
-    
-    FIXED: Includes Windows file locking robustness with proper cleanup.
-    """
-    
-    def __init__(
-        self,
-        monitor: str = 'dice_multi_strip',
-        model_save_path: Path = None,
-        learner_save_name: str = None,
-        save_format: str = 'safetensors'
-    ):
-        """
-        Args:
-            monitor: Metric name to monitor for best model (default: dice_multi_strip)
-            model_save_path: Directory path to save models
-            learner_save_name: Base name for saving fastai learner
-            save_format: Format to save models ('safetensors' or 'pth')
-        """
-        self.monitor = monitor
-        self.model_save_path = model_save_path
-        self.learner_save_name = learner_save_name
-        self.save_format = save_format
-        self.best_score = -float('inf')
-        self.best_epoch = 0
-        self.best_model_state = None
-        self._already_saved = False  # Guard: prevent double-save after training
-        self._evaluation_mode = False  # Guard: prevent saves during evaluation
-        store_attr()
-    
-    def after_validate(self):
-        """Called after validation at the end of each epoch."""
-        # Completely defensive approach to get the current metric value
-        try:
-            # Method 1: Try to get recorder safely using getattr
-            recorder = getattr(self.learn, 'recorder', None)
-            
-            if recorder is None:
-                logger.debug(f"No recorder found at epoch {self.learn.epoch}")
-                return
-            
-            # Method 2: Try to get values from recorder
-            values = getattr(recorder, 'values', None)
-            
-            if values is None or len(values) == 0:
-                logger.debug(f"No values in recorder at epoch {self.learn.epoch}")
-                return
-            
-            # Get the latest recorded values
-            latest_values = values[-1]
-            
-            if latest_values is None or len(latest_values) == 0:
-                logger.debug(f"No latest_values at epoch {self.learn.epoch}")
-                return
-            
-            # Method 3: Try to find the metric index
-            metric_index = -1
-            
-            # Try to get metrics_names safely
-            metrics_names = getattr(recorder, 'metrics_names', None)
-            
-            if metrics_names is not None and self.monitor in metrics_names:
-                metric_index = metrics_names.index(self.monitor)
-            else:
-                # Fallback: assume dice_multi_strip is at index 2
-                # Format is usually: [train_loss, valid_loss, metric1, metric2, ...]
-                if len(latest_values) >= 3:
-                    metric_index = 2
-                    logger.debug(f"Using index 2 for metric (assumed {self.monitor})")
-                else:
-                    logger.debug(f"Not enough values in latest_values: {len(latest_values)}")
-                    return
-            
-            # Check if metric_index is valid
-            if metric_index < 0 or metric_index >= len(latest_values):
-                logger.debug(f"Invalid metric_index {metric_index} for latest_values length {len(latest_values)}")
-                return
-            
-            # Get the current metric value
-            current_score = latest_values[metric_index]
-            
-            # Check if the score is valid (not NaN or inf)
-            if not isinstance(current_score, (int, float)):
-                logger.debug(f"Metric is not a number: {type(current_score)}")
-                return
-            
-            if np.isnan(current_score) or np.isinf(current_score):
-                logger.debug(f"Invalid metric value at epoch {self.learn.epoch}: {current_score}")
-                return
-            
-            # Update best model if current score is better
-            if current_score > self.best_score:
-                self.best_score = current_score
-                self.best_epoch = self.learn.epoch
-                # Save the best model state (clone to CPU to avoid reference issues)
-                self.best_model_state = {k: v.cpu().clone() for k, v in self.learn.model.state_dict().items()}
-                logger.info(f"  📈 New best model saved at epoch {self.learn.epoch} with {self.monitor}={current_score:.6f}")
-        
-        except Exception as e:
-            logger.error(f"Error in after_validate at epoch {self.learn.epoch}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Don't raise the exception to allow training to continue
-    
-    def after_fit(self):
-        """Called at the end of training."""
-        # Guard: Skip if already saved OR in evaluation mode
-        already_saved = getattr(self, '_already_saved', False)
-        eval_mode = getattr(self, '_evaluation_mode', False)
-        
-        if already_saved or eval_mode:
-            if eval_mode:
-                logger.debug("Evaluation mode - skipping save to prevent file locks")
-            else:
-                logger.debug("Models already saved - skipping duplicate save")
-            return
-        
-        self._already_saved = True
-        
-        # Save the latest model
-        logger.info("\nSaving models...")
-        
-        try:
-            # Save latest fastai learner
-            self.learn.save(f"{self.learner_save_name}_latest")
-            logger.info(f"  ✓ Saved latest Fastai learner: {self.learner_save_name}_latest")
-            
-            # Convert to CPU and float32 for saving
-            model_cpu = self.learn.model.to("cpu").float()
-            
-            # Release GPU memory but keep the model reference in learner
-            # (we need it for loading best model state later)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            gc.collect()
-            
-            # Small delay to allow Windows to release file locks
-            time.sleep(0.2)
-            
-            # Save latest model in safetensors/pytorch format
-            if self.save_format == 'safetensors':
-                latest_path = self.model_save_path / f"{self.learner_save_name}_latest.safetensors"
-                
-                # Use safe_file_save with retry logic
-                success = safe_file_save(
-                    save_file,
-                    model_cpu.state_dict(),
-                    latest_path,
-                    operation_name=f"Save latest model (safetensors): {latest_path.name}",
-                    max_retries=MAX_SAVE_RETRIES,
-                    retry_delay=SAVE_RETRY_DELAY
-                )
-                
-                if success:
-                    logger.info(f"  ✓ Saved latest model (safetensors): {latest_path.name}")
-                else:
-                    logger.error(f"  ✗ Failed to save latest safetensors after retries")
-                
-                # Increased delay between saves
-                time.sleep(0.3)
-                
-                # Save best model in safetensors format
-                if self.best_model_state is not None:
-                    best_path = self.model_save_path / f"{self.learner_save_name}_best.safetensors"
-                    
-                    # Clear any references to prevent file locking
-                    gc.collect()
-                    time.sleep(0.2)
-                    
-                    success = safe_file_save(
-                        save_file,
-                        self.best_model_state,
-                        best_path,
-                        operation_name=f"Save best model (safetensors): {best_path.name}",
-                        max_retries=MAX_SAVE_RETRIES,
-                        retry_delay=SAVE_RETRY_DELAY
-                    )
-                    
-                    if success:
-                        logger.info(f"  ✓ Saved best model (safetensors): {best_path.name}")
-                        logger.info(f"  Best model from epoch {self.best_epoch} with {self.monitor}={self.best_score:.6f}")
-                        
-                        # Also save best fastai learner
-                        self.learn.model.load_state_dict(self.best_model_state)
-                        self.learn.save(f"{self.learner_save_name}_best")
-                        logger.info(f"  ✓ Saved best Fastai learner: {self.learner_save_name}_best")
-                        
-                        # Restore the latest model state
-                        self.learn.model.load_state_dict(model_cpu.state_dict())
-                    else:
-                        logger.error(f"  ✗ Failed to save best safetensors after retries")
-                        logger.warning(f"  ⚠ Best model not saved in safetensors format, using latest model as fallback")
-                        # Fall back to latest model
-                        self.learn.save(f"{self.learner_save_name}_best")
-                        logger.info(f"  ✓ Saved latest as best Fastai learner (fallback): {self.learner_save_name}_best")
-                else:
-                    logger.warning(f"  ⚠ No best model state saved (metric tracking may have failed)")
-                    # Save latest as best if no best was found
-                    best_path = self.model_save_path / f"{self.learner_save_name}_best.safetensors"
-                    
-                    gc.collect()
-                    time.sleep(0.2)
-                    
-                    success = safe_file_save(
-                        save_file,
-                        model_cpu.state_dict(),
-                        best_path,
-                        operation_name=f"Save latest as best (safetensors): {best_path.name}",
-                        max_retries=MAX_SAVE_RETRIES,
-                        retry_delay=SAVE_RETRY_DELAY
-                    )
-                    
-                    if success:
-                        logger.info(f"  ✓ Saved latest model as best (safetensors): {best_path.name}")
-                    
-                    self.learn.save(f"{self.learner_save_name}_best")
-                    logger.info(f"  ✓ Saved latest as best Fastai learner: {self.learner_save_name}_best")
-            else:
-                # Save in pytorch format
-                latest_path = self.model_save_path / f"{self.learner_save_name}_latest_state.pth"
-                
-                success = safe_file_save(
-                    torch.save,
-                    model_cpu.state_dict(),
-                    latest_path,
-                    operation_name=f"Save latest model (pytorch): {latest_path.name}",
-                    max_retries=MAX_SAVE_RETRIES,
-                    retry_delay=SAVE_RETRY_DELAY
-                )
-                
-                if success:
-                    logger.info(f"  ✓ Saved latest model (pytorch): {latest_path.name}")
-                
-                time.sleep(0.2)
-                
-                if self.best_model_state is not None:
-                    best_path = self.model_save_path / f"{self.learner_save_name}_best_state.pth"
-                    
-                    gc.collect()
-                    time.sleep(0.2)
-                    
-                    success = safe_file_save(
-                        torch.save,
-                        self.best_model_state,
-                        best_path,
-                        operation_name=f"Save best model (pytorch): {best_path.name}",
-                        max_retries=MAX_SAVE_RETRIES,
-                        retry_delay=SAVE_RETRY_DELAY
-                    )
-                    
-                    if success:
-                        logger.info(f"  ✓ Saved best model (pytorch): {best_path.name}")
-                        logger.info(f"  Best model from epoch {self.best_epoch} with {self.monitor}={self.best_score:.6f}")
-                        
-                        # Also save best fastai learner
-                        self.learn.model.load_state_dict(self.best_model_state)
-                        self.learn.save(f"{self.learner_save_name}_best")
-                        logger.info(f"  ✓ Saved best Fastai learner: {self.learner_save_name}_best")
-                        
-                        # Restore the latest model state
-                        self.learn.model.load_state_dict(model_cpu.state_dict())
-                    else:
-                        logger.error(f"  ✗ Failed to save best pytorch after retries")
-                        # Save latest as best if no best was found
-                        best_path = self.model_save_path / f"{self.learner_save_name}_best_state.pth"
-                        
-                        gc.collect()
-                        time.sleep(0.2)
-                        
-                        safe_file_save(
-                            torch.save,
-                            model_cpu.state_dict(),
-                            best_path,
-                            operation_name=f"Save latest as best (pytorch): {best_path.name}",
-                            max_retries=MAX_SAVE_RETRIES,
-                            retry_delay=SAVE_RETRY_DELAY
-                        )
-                        
-                        self.learn.save(f"{self.learner_save_name}_best")
-                        logger.info(f"  ✓ Saved latest as best Fastai learner: {self.learner_save_name}_best")
-                else:
-                    logger.warning(f"  ⚠ No best model state saved (metric tracking may have failed)")
-                    # Save latest as best if no best was found
-                    best_path = self.model_save_path / f"{self.learner_save_name}_best_state.pth"
-                    
-                    gc.collect()
-                    time.sleep(0.2)
-                    
-                    safe_file_save(
-                        torch.save,
-                        model_cpu.state_dict(),
-                        best_path,
-                        operation_name=f"Save latest as best (pytorch): {best_path.name}",
-                        max_retries=MAX_SAVE_RETRIES,
-                        retry_delay=SAVE_RETRY_DELAY
-                    )
-                    
-                    self.learn.save(f"{self.learner_save_name}_best")
-                    logger.info(f"  ✓ Saved latest as best Fastai learner: {self.learner_save_name}_best")
-        
-        except Exception as e:
-            logger.error(f"Error in after_fit: {e}")
-            import traceback
-            traceback.print_exc()
-            # Don't raise exception to allow training to complete
 
 
 def fine_tune_single_model(
@@ -748,12 +346,12 @@ def fine_tune_single_model(
         config_path = models_dir / f"{base_identifier}_finetuned_config.json"
         
         # Log the output paths with emphasis on safetensors (primary format)
-        logger.info(f"Output base name: {base_identifier}")
-        logger.info(f"PRIMARY OUTPUT -> Safetensors: {safetensor_state_path.name}")
-        logger.info(f"  Fastai model: {fai_model_name}")
-        logger.info(f"  PyTorch state dict: {state_path.name}")
-        logger.info(f"  PyTorch full model: {pytorch_model_path.name}")
-        logger.info(f"  Config JSON: {config_path.name}")
+        logger.debug(f"Output base name: {base_identifier}")
+        logger.debug(f"PRIMARY OUTPUT -> Safetensors: {safetensor_state_path.name}")
+        logger.debug(f"  Fastai model: {fai_model_name}")
+        logger.debug(f"  PyTorch state dict: {state_path.name}")
+        logger.debug(f"  PyTorch full model: {pytorch_model_path.name}")
+        logger.debug(f"  Config JSON: {config_path.name}")
         
         if safetensor_state_path.exists():
             logger.warning(f"Warning: Safetensors file {safetensor_state_path.name} already exists. Will overwrite.")
@@ -936,7 +534,7 @@ def fine_tune_single_model(
         )
         
         try:
-            logger.info("Fetching one batch...")
+            logger.debug("Fetching one batch...")
             batch = dl.one_batch()
             logger.debug(f"Input shape: {batch[0].shape}")
             logger.debug(f"Label shape: {batch[1].shape}")
@@ -947,22 +545,46 @@ def fine_tune_single_model(
         # --- TRAINING ---
         callbacks = [
             GradientAccumulation(training_config['gradient_accumulation_batch_size']),
+            CompositeMetricCallback(dice_weight=0.3, recall_weight=0.7),
             SaveBestAndLatestModel(
-                monitor='dice_multi_strip',
+                monitor='composite_score',
                 model_save_path=models_dir,
                 learner_save_name=base_identifier,
                 save_format='safetensors'
             ),
+            ReduceLROnPlateauCustom(
+                monitor='composite_score',
+                factor=0.1,  # Reduce LR by 10x when plateau detected
+                patience=3,  # Wait 3 epochs with no improvement before reducing
+                min_lr=1e-7,  # Minimum learning rate threshold
+                mode='max'  # Higher composite_score is better
+            ),
+            EarlyStoppingRecall(
+                monitor='recall_multi_strip',
+                patience=5,  # Slightly higher patience for recall
+                min_delta=0.001
+            ),
         ]
-        
+
         logger.info("Initializing Learner...")
         learner = Learner(
             dls=dl,
             model=model,
-            loss_func=CrossEntropyLossFlatImageTypeWeighted(),
-            metrics=[DiceMultiStrip],
+            loss_func=CrossEntropyLossFlatImageTypeWeighted(
+                class_weights=training_config['class_weights']
+            ),
+            metrics=[DiceMultiStrip, RecallMultiStrip],
             cbs=callbacks,
         )
+
+        # Log callback instances
+        logger.debug(f"🔧 Learner callbacks: {[type(cb).__name__ for cb in learner.cbs]}")
+        save_callback = None
+        for cb in learner.cbs:
+            if type(cb).__name__ == 'SaveBestAndLatestModel':
+                save_callback = cb
+                logger.debug(f"🔧 SaveBestAndLatestModel callback found (id={id(cb)}, _init_id={getattr(cb, '_init_id', 'N/A')})")
+                break
         
         if training_config['use_bf16']:
             learner = learner.to_bf16()
@@ -971,19 +593,28 @@ def fine_tune_single_model(
             f"Starting Fine Tuning: Freeze {training_config['freeze_epochs']}, "
             f"Unfreeze {training_config['unfrozen_epochs']}"
         )
+
+        # Log callback state before fine_tune
+        if save_callback:
+            logger.debug(f"🔧 Before fine_tune: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
+
         learner.fine_tune(
             epochs=training_config['unfrozen_epochs'],
             freeze_epochs=training_config['freeze_epochs'],
             base_lr=training_config['learning_rate'],
         )
+
+        # Log callback state after fine_tune
+        if save_callback:
+            logger.debug(f"🔧 After fine_tune: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
         
         # --- SAVING ---
         # Note: SaveBestAndLatestModel callback has already saved both best and latest models
         # We now save additional formats and verify integrity
         
         # Get the best model info from the callback
-        save_best_callback = learner.cbs[-1]  # The last callback is our SaveBestAndLatestModel
-        best_dice_score = save_best_callback.best_score
+        save_best_callback = learner.cbs[-3]  # The last callback is our SaveBestAndLatestModel
+        best_composite_score = save_best_callback.best_score
         best_epoch = save_best_callback.best_epoch
         
         # Convert to CPU and float32 for additional saving
@@ -991,10 +622,10 @@ def fine_tune_single_model(
         
         # Save additional formats for latest model
         torch.save(model_cpu.state_dict(), state_path)
-        logger.info(f"  ✓ Saved latest PyTorch state dict: {state_path.name}")
+        logger.debug(f"  ✓ Saved latest PyTorch state dict: {state_path.name}")
         
         torch.save(model_cpu, pytorch_model_path)
-        logger.info(f"  ✓ Saved latest PyTorch full model: {pytorch_model_path.name}")
+        logger.debug(f"  ✓ Saved latest PyTorch full model: {pytorch_model_path.name}")
         
         # Verify latest safetensors integrity (saved by callback)
         latest_safetensors_path = models_dir / f"{base_identifier}_latest.safetensors"
@@ -1044,7 +675,8 @@ def fine_tune_single_model(
             "unfrozen_epochs": training_config['unfrozen_epochs'],
             "limit_training_images": training_config['limit_training_images'],
             "safetensors_integrity_verified": safetensors_valid,
-            "best_dice_score": float(best_dice_score),
+            "class_weights": training_config['class_weights'].tolist(),
+            "best_composite_score": float(best_composite_score),
             "best_epoch": int(best_epoch),
         }
         with open(config_path, "w") as f:
@@ -1052,7 +684,7 @@ def fine_tune_single_model(
         logger.info(f"  ✓ Saved config: {config_path.name}")
         
         logger.info(f"\n✓ Fine-tuning complete. Models saved to {models_dir}")
-        logger.info(f"  BEST MODEL (dice_multi_strip={best_dice_score:.6f} at epoch {best_epoch}):")
+        logger.info(f"  BEST MODEL (composite_score={best_composite_score:.6f} at epoch {best_epoch}):")
         logger.info(f"    - {base_identifier}_best.safetensors (PRIMARY - safetensors)")
         logger.info(f"    - {base_identifier}_best.pth (fastai learner)")
         logger.info(f"  LATEST MODEL:")
@@ -1064,7 +696,11 @@ def fine_tune_single_model(
         # --- EVALUATION WITH FILE LOCK PREVENTION ---
         results_dir = output_base_dir / f"results_{base_identifier}"
         results_dir.mkdir(exist_ok=True)
-        
+
+        # Add MetricLogger callback with log file path
+        log_file_path = results_dir / 'training_log.txt'
+        learner.add_cb(MetricLogger(class_names=CLASS_NAMES, log_file=str(log_file_path)))
+
         # CRITICAL: Find and set evaluation mode on the callback to prevent file locks
         save_callback = None
         for cb in learner.cbs:
@@ -1074,7 +710,7 @@ def fine_tune_single_model(
         
         if save_callback:
             save_callback._evaluation_mode = True
-            logger.info("Evaluation mode ENABLED - callback will NOT save during metrics computation")
+            logger.debug("Evaluation mode ENABLED - callback will NOT save during metrics computation")
         
         try:
             logger.info("\nGenerating evaluation metrics...")
@@ -1115,7 +751,7 @@ def fine_tune_single_model(
             # CRITICAL: Always disable evaluation mode
             if save_callback:
                 save_callback._evaluation_mode = False
-                logger.info("Evaluation mode DISABLED")
+                logger.debug("Evaluation mode DISABLED")
         
         logger.info(f"✓ Results saved to {results_dir}")
         return True
@@ -1205,9 +841,15 @@ def main():
         native_band_scales = [1, 1, 1]
     
     gradient_accumulation_batch_size = 128
-    batch_size = 10
+    batch_size = 6
     learning_rate = 0.0001
-    
+
+    # Class weights for recall-focused training
+    # [Clear, Thick Cloud, Thin Cloud, Cloud Shadow]
+    # Higher weights on Thin Cloud and Cloud Shadow to minimize false negatives
+    CLASS_WEIGHTS = torch.tensor([0.5, 2.0, 3.0, 3.0])
+    logger.info(f"Class weights: {CLASS_WEIGHTS.tolist()}")
+
     my_custom_weight = 1.0
     
     label_weights = {
@@ -1227,9 +869,10 @@ def main():
         unfrozen_epochs = 5
         limit_training_images = 3000
     else:
-        # Default for custom fine-tuning: Conservative epoch count to prevent catastrophic forgetting
-        freeze_epochs = 6
-        unfrozen_epochs = 12
+        # Default for custom fine-tuning: Increased epoch count with LR reduction on plateau
+        # ReduceLROnPlateau callback will automatically reduce LR when model saturates
+        freeze_epochs = 1
+        unfrozen_epochs = 3
         limit_training_images = None
     
     num_input_channels = len(limited_band_read_list)
@@ -1280,6 +923,7 @@ def main():
             'dataset_dirs': dataset_dirs,
             'cloudsen12_validation_dir': cloudsen12_validation_dir,
             'label_weights': label_weights,
+            'class_weights': CLASS_WEIGHTS,  # Add class weights for recall-focused training
         }
         
         # Fine-tune this model
@@ -1304,10 +948,15 @@ def main():
     logger.info(f"Successful: {success_count}")
     logger.info(f"Failed: {failure_count}")
     logger.info(f"Output directory: {output_base_dir}")
+    logger.info(f"\nRECALL-FOCUSED TRAINING STRATEGY:")
+    logger.info(f"  - Class weights: [Clear=0.5, Thick Cloud=2.0, Thin Cloud=3.0, Cloud Shadow=3.0]")
+    logger.info(f"  - Composite metric: 30% Dice + 70% Recall")
+    logger.info(f"  - Model selection: Based on composite_score (prioritizes recall)")
+    logger.info(f"  - Early stopping: Monitors recall_multi_strip with patience=5")
     logger.info(f"\nPRIMARY OUTPUT FORMAT: .safetensors files")
     logger.info(f"All safetensors files have been integrity-verified")
     logger.info(f"\nFor each model, two versions are saved:")
-    logger.info(f"  - BEST model: Best performing model based on dice_multi_strip metric")
+    logger.info(f"  - BEST model: Best performing model based on composite_score metric")
     logger.info(f"  - LATEST model: Final model after all training epochs")
     logger.info(f"This prevents overfitting by preserving the best performing model.")
     logger.info(f"{'='*80}\n")
