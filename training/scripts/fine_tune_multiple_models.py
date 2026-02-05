@@ -6,15 +6,20 @@ and performs fine-tuning on each one using the training data defined in local_co
 It uses the training methodology from train_ocm_models_custom.py with the modern
 model loading mechanism from compare_ocm_models.py for full v4 'smp' compatibility.
 
-RECALL-FOCUSED TRAINING STRATEGY:
+RECALL-FOCUSED TRAINING STRATEGY WITH PRECISION GUARDRAIL:
 - Primary goal: Minimize false negatives (critical for application)
-- Metric weighting: 30% Dice + 70% Recall (prioritizes recall)
+- Secondary goal: Minimize false positives (precision guardrail)
+- Metric weighting: 30% Dice + 50% Recall + 20% Precision
+  - Recall prioritized (50%) to minimize false negatives
+  - Precision included (20%) to guard against excessive false positives
+  - Dice score (30%) for overall segmentation quality
 - Class weights: [Clear=0.5, Thick Cloud=2.0, Thin Cloud=3.0, Cloud Shadow=3.0]
 - Critical classes: Thin Cloud and Cloud Shadow (highest priority)
 - Leniency: Thin Cloud can be detected as Thick Cloud, but NO leniency for Cloud Shadow
-- Model selection: Based on composite score (30% Dice + 70% Recall)
+- Model selection: Based on composite score (30% Dice + 50% Recall + 20% Precision)
+- Precision guardrail: Models with precision < 0.5 receive a penalty to their composite score
 - Early stopping: Monitors recall_multi_strip with patience=5
-- Logging: Per-class metrics tracked via MetricLogger callback
+- Logging: Per-class metrics tracked via MetricLogger callback (now includes precision and IoU)
 
 IMPROVEMENTS:
 - Output filenames preserve unique identifiers from checkpoint names (no overwriting)
@@ -23,10 +28,13 @@ IMPROVEMENTS:
 - Better error checking for safetensors file integrity
 - Automatic best model tracking: Saves both best and latest models during training
   - Best model is selected based on composite_score metric (higher is better)
-  - Composite score = 0.3 * dice_multi_strip + 0.7 * recall_multi_strip
+  - Composite score = 0.3 * dice + 0.5 * recall + 0.2 * precision
+  - Precision guardrail: If precision < 0.5, score is penalized proportionally
   - Prevents overfitting by preserving the best performing model
   - Both models are saved in safetensors and fastai learner formats
 - FIXED: Windows file locking issues with proper cleanup and retry logic
+- NEW: Added PrecisionMultiStrip and IoUMultiStrip metrics for comprehensive monitoring
+- NEW: Precision guardrail prevents models with too many false positives from being saved
 """
 
 import sys
@@ -98,6 +106,8 @@ try:
     from utils import (
         DiceMultiStrip,
         RecallMultiStrip,
+        PrecisionMultiStrip,
+        IoUMultiStrip,
         CrossEntropyLossFlatImageTypeWeighted,
         EarlyStoppingRecall,
         MetricLogger,
@@ -545,7 +555,7 @@ def fine_tune_single_model(
         # --- TRAINING ---
         callbacks = [
             GradientAccumulation(training_config['gradient_accumulation_batch_size']),
-            CompositeMetricCallback(dice_weight=0.3, recall_weight=0.7),
+            CompositeMetricCallback(dice_weight=0.3, recall_weight=0.5, precision_weight=0.2, min_precision=0.6),
             SaveBestAndLatestModel(
                 monitor='composite_score',
                 model_save_path=models_dir,
@@ -561,7 +571,8 @@ def fine_tune_single_model(
             ),
             EarlyStoppingRecall(
                 monitor='recall_multi_strip',
-                patience=5,  # Slightly higher patience for recall
+                frozen_patience=1,  # Short patience for frozen phase (cloud segmentation improves quickly)
+                unfrozen_patience=3,  # Longer patience for unfrozen phase (encoder adaptation)
                 min_delta=0.001
             ),
         ]
@@ -573,7 +584,7 @@ def fine_tune_single_model(
             loss_func=CrossEntropyLossFlatImageTypeWeighted(
                 class_weights=training_config['class_weights']
             ),
-            metrics=[DiceMultiStrip, RecallMultiStrip],
+            metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
             cbs=callbacks,
         )
 
@@ -701,16 +712,17 @@ def fine_tune_single_model(
         log_file_path = results_dir / 'training_log.txt'
         learner.add_cb(MetricLogger(class_names=CLASS_NAMES, log_file=str(log_file_path)))
 
-        # CRITICAL: Find and set evaluation mode on the callback to prevent file locks
-        save_callback = None
+        # CRITICAL: Find and set evaluation mode on ALL callbacks to prevent file locks and unwanted operations
+        callbacks_with_eval_mode = []
         for cb in learner.cbs:
-            if type(cb).__name__ == 'SaveBestAndLatestModel':
-                save_callback = cb
-                break
+            cb_type = type(cb).__name__
+            # Set evaluation mode on all callbacks that support it
+            if hasattr(cb, '_evaluation_mode'):
+                cb._evaluation_mode = True
+                callbacks_with_eval_mode.append(cb)
+                logger.debug(f"Evaluation mode ENABLED on {cb_type} - callback will skip during metrics computation")
         
-        if save_callback:
-            save_callback._evaluation_mode = True
-            logger.debug("Evaluation mode ENABLED - callback will NOT save during metrics computation")
+        logger.info(f"Evaluation mode enabled on {len(callbacks_with_eval_mode)} callbacks")
         
         try:
             logger.info("\nGenerating evaluation metrics...")
@@ -744,14 +756,18 @@ def fine_tune_single_model(
                 logger.info("  ✓ Training metrics complete")
             except Exception as e:
                 # Don't fail training - models are already saved!
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"Warning: Error during training metrics: {e}")
                 logger.warning(f"  This doesn't affect the saved models - they are safe!")
         
         finally:
-            # CRITICAL: Always disable evaluation mode
-            if save_callback:
-                save_callback._evaluation_mode = False
-                logger.debug("Evaluation mode DISABLED")
+            # CRITICAL: Always disable evaluation mode on ALL callbacks
+            for cb in callbacks_with_eval_mode:
+                cb._evaluation_mode = False
+                logger.debug(f"Evaluation mode DISABLED on {type(cb).__name__}")
+            
+            logger.info("Evaluation mode disabled - callbacks restored to normal operation")
         
         logger.info(f"✓ Results saved to {results_dir}")
         return True
@@ -841,7 +857,7 @@ def main():
         native_band_scales = [1, 1, 1]
     
     gradient_accumulation_batch_size = 128
-    batch_size = 6
+    batch_size = 10
     learning_rate = 0.0001
 
     # Class weights for recall-focused training
@@ -871,8 +887,8 @@ def main():
     else:
         # Default for custom fine-tuning: Increased epoch count with LR reduction on plateau
         # ReduceLROnPlateau callback will automatically reduce LR when model saturates
-        freeze_epochs = 1
-        unfrozen_epochs = 3
+        freeze_epochs = 2
+        unfrozen_epochs = 14
         limit_training_images = None
     
     num_input_channels = len(limited_band_read_list)

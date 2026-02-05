@@ -35,7 +35,7 @@ from safetensors.torch import save_file
 import timm
 from rasterio.enums import Resampling
 from rasterio.errors import NotGeoreferencedWarning
-from custom_model_utils import build_custom_model, load_custom_weights
+from training.scripts.custom_model_utils import build_custom_model, load_custom_weights
 # Local imports from training/
 try:
     from augs import (

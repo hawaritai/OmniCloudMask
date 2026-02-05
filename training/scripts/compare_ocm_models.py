@@ -78,7 +78,7 @@ try:
             INFERENCE_CONFIG
         )
     except ImportError:
-        COMPARISON_QUICK_TEST = True
+        COMPARISON_QUICK_TEST = False
         COMPARISON_QUICK_TEST_SAMPLES = 50
         COMPARISON_BATCH_SIZE = 8
         COMPARISON_USE_BF16 = False
@@ -312,7 +312,7 @@ model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
 # models_dir = project_root / "ckpts"
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v6\models")
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v8.1\models")
 bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
 
 if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
@@ -435,7 +435,7 @@ class ModelComparator:
         Returns:
             Tuple of (image_files, label_files) or ([], []) on failure
         """
-        val_dir = TRAIN_DATA_DIR / "validation"
+        val_dir = TRAIN_DATA_DIR / "test"
         if not val_dir.exists():
             logger.error(f"Validation directory not found: {val_dir}")
             return [], []

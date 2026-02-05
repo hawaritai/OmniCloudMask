@@ -7,7 +7,7 @@ import torch
 import cv2
 import rasterio as rio
 import timm
-from custom_model_utils import build_custom_model, load_custom_weights
+from training.scripts.custom_model_utils import build_custom_model, load_custom_weights
 
 import matplotlib
 matplotlib.use('Agg')

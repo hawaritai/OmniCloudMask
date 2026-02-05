@@ -165,7 +165,7 @@ def preprocess_images():
                 data_img_rgb = src_img.read(
                     [1, 2, 3],
                     out_shape=(3, new_h, new_w),
-                    resampling=Resampling.bilinear
+                    resampling=Resampling.cubic
                 )
                 
                 # Upsample mask (use nearest neighbor to preserve class values)
@@ -240,9 +240,9 @@ def preprocess_images():
                         red=red,
                         green=green,
                         nir=nir_synthetic,
-                        normalize=True,
-                        scale_to_dn=True,
-                        dn_range=(0, 10000)
+                        # normalize=True,
+                        # scale_to_dn=True,
+                        # dn_range=(0, 10000)
                     )
 
                 # Tile into 509×509 patches

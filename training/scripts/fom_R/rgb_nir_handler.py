@@ -103,7 +103,7 @@ class RGBNIRHandler:
         dn_min, dn_max = target_range
         return band * (dn_max - dn_min) + dn_min
     
-    def stack_rgb_nir(
+    def _stack_rgb_nir(
         self,
         red: np.ndarray,
         green: np.ndarray,
@@ -166,6 +166,63 @@ class RGBNIRHandler:
         
         # Stack: [RED, GREEN, NIR] - ORDER MATTERS FOR OMNICLOUDMASK
         rgn_stack = np.stack([red, green, nir], axis=0)  # Shape: (3, H, W)
+        
+        return rgn_stack.astype(np.float32)
+    
+    
+    def stack_rgb_nir(
+        self,
+        red: np.ndarray,
+        green: np.ndarray,
+        nir: np.ndarray,
+        # We remove the old flags because they are dangerous for this workflow
+    ) -> np.ndarray:
+        """
+        Stack RGB bands with NIR for OmniCloudMask fine-tuning.
+        Performs LINEAR scaling to preserve physical intensity.
+        
+        Args:
+            red: Red band (H, W) - Expected range 0-255
+            green: Green band (H, W) - Expected range 0-255
+            nir: NIR band (H, W) - Expected range 0-1 (from NIRGAN)
+        
+        Returns:
+            Stacked array (3, H, W) [RED, GREEN, NIR] in range 0-10000
+        """
+        # 1. Handle Dimensions
+        if red.ndim == 3: red = red[:, :, 0]
+        if green.ndim == 3: green = green[:, :, 0]
+        if nir.ndim == 3: nir = nir[:, :, 0]
+        
+        # 2. Convert to float32 for math
+        red = red.astype(np.float32)
+        green = green.astype(np.float32)
+        nir = nir.astype(np.float32)
+        
+        # 3. LINEAR SCALING (The Fix)
+        # Sentinel-2 is 12-bit (0-4096) or 16-bit, commonly scaled to 10000.
+        # Aerial images are 8-bit (0-255).
+        # We map 255 (Max Aerial) -> 10000 (Max Sentinel)
+        # This assumes bright white in aerial = bright cloud in Sentinel.
+        
+        red = (red / 255.0) * 10000.0
+        green = (green / 255.0) * 10000.0
+        
+        # # 4. Handle NIR
+        # # NIRGAN outputs 0-1. We simply multiply by 10000.
+        # # If NIRGAN output was already 0-10000, comment out the multiplication.
+        # if nir.max() <= 1.0:
+        #     nir = nir * 10000.0
+            
+        # 5. Clip to ensure safety (clean up artifacts)
+        # Sentinel data technically allows >10000 for specular reflection, 
+        # but for training stability, clipping to range is safer.
+        red = np.clip(red, 0, 10000)
+        green = np.clip(green, 0, 10000)
+        nir = np.clip(nir, 0, 10000)
+
+        # 6. Stack [RED, GREEN, NIR]
+        rgn_stack = np.stack([red, green, nir], axis=0)
         
         return rgn_stack.astype(np.float32)
     

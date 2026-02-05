@@ -6,7 +6,7 @@ import gc
 import torch
 import torch.nn.functional as F
 from fastai.metrics import DiceMulti, RecallMulti, Metric
-from fastai.callback.core import Callback, CancelFitException
+from fastai.callback.core import Callback, CancelFitException, CancelTrainException
 from fastai.basics import store_attr
 from torch import Tensor
 import numpy as np
@@ -100,6 +100,142 @@ class RecallMultiStrip(Metric):
         return self.tp / (self.tp + self.fn)
 
 
+class PrecisionMultiStrip(Metric):
+    """
+    Precision metric for multi-class segmentation that only looks at the first element if y is a tuple.
+
+    Precision measures how many of the predicted positive pixels are actually positive.
+    Formula: Precision = TP / (TP + FP)
+
+    This metric is important as a guardrail against false positives - a model with
+    high recall but low precision will predict many false positives, which is undesirable.
+    """
+
+    def __init__(self, axis=1):
+        self.axis = axis
+        self.reset()
+
+    def reset(self):
+        """Reset metric state"""
+        self.tp = 0  # True positives
+        self.fp = 0  # False positives
+
+    def accumulate(self, learn):
+        """Accumulate metric for one batch"""
+        # Temporarily modify learn.yb (the underlying batch) instead of learn.y
+        yb_backup = learn.yb
+
+        # Extract targets if it's a tuple
+        if isinstance(learn.yb, (tuple, list)) and len(learn.yb) > 0:
+            if isinstance(learn.yb[0], (tuple, list)):
+                # If yb contains tuples, extract the first element of each tuple
+                learn.yb = (learn.yb[0][0],)  # Just the targets, keep it as a tuple
+            else:
+                learn.yb = (learn.yb[0],)  # Wrap in tuple to maintain structure
+
+        try:
+            # Get predictions and targets
+            pred = learn.pred.argmax(dim=self.axis)
+            targ = learn.y
+
+            # Flatten for per-pixel comparison
+            pred_flat = pred.flatten()
+            targ_flat = targ.flatten()
+
+            # Calculate True Positives and False Positives for each class
+            for c in range(learn.pred.shape[self.axis]):
+                # True positives: predicted as c and actually c
+                tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
+                # False positives: predicted as c but actually not c
+                fp = ((pred_flat == c) & (targ_flat != c)).sum().item()
+
+                self.tp += tp
+                self.fp += fp
+
+        finally:
+            # Always restore the original yb
+            learn.yb = yb_backup
+
+    @property
+    def value(self):
+        """Calculate precision: TP / (TP + FP)"""
+        # Avoid division by zero
+        if self.tp + self.fp == 0:
+            return 0.0
+        return self.tp / (self.tp + self.fp)
+
+
+class IoUMultiStrip(Metric):
+    """
+    IoU (Intersection over Union) metric for multi-class segmentation that only looks
+    at the first element if y is a tuple.
+
+    IoU measures the overlap between predicted and actual masks.
+    Formula: IoU = TP / (TP + FP + FN)
+
+    This metric provides a balanced view of model performance by considering both
+    false positives and false negatives. It's useful for monitoring but not
+    directly used in the composite score.
+    """
+
+    def __init__(self, axis=1):
+        self.axis = axis
+        self.reset()
+
+    def reset(self):
+        """Reset metric state"""
+        self.tp = 0  # True positives
+        self.fp = 0  # False positives
+        self.fn = 0  # False negatives
+
+    def accumulate(self, learn):
+        """Accumulate metric for one batch"""
+        # Temporarily modify learn.yb (the underlying batch) instead of learn.y
+        yb_backup = learn.yb
+
+        # Extract targets if it's a tuple
+        if isinstance(learn.yb, (tuple, list)) and len(learn.yb) > 0:
+            if isinstance(learn.yb[0], (tuple, list)):
+                # If yb contains tuples, extract the first element of each tuple
+                learn.yb = (learn.yb[0][0],)  # Just the targets, keep it as a tuple
+            else:
+                learn.yb = (learn.yb[0],)  # Wrap in tuple to maintain structure
+
+        try:
+            # Get predictions and targets
+            pred = learn.pred.argmax(dim=self.axis)
+            targ = learn.y
+
+            # Flatten for per-pixel comparison
+            pred_flat = pred.flatten()
+            targ_flat = targ.flatten()
+
+            # Calculate TP, FP, and FN for each class
+            for c in range(learn.pred.shape[self.axis]):
+                # True positives: predicted as c and actually c
+                tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
+                # False positives: predicted as c but actually not c
+                fp = ((pred_flat == c) & (targ_flat != c)).sum().item()
+                # False negatives: actually c but not predicted as c
+                fn = ((pred_flat != c) & (targ_flat == c)).sum().item()
+
+                self.tp += tp
+                self.fp += fp
+                self.fn += fn
+
+        finally:
+            # Always restore the original yb
+            learn.yb = yb_backup
+
+    @property
+    def value(self):
+        """Calculate IoU: TP / (TP + FP + FN)"""
+        # Avoid division by zero
+        if self.tp + self.fp + self.fn == 0:
+            return 0.0
+        return self.tp / (self.tp + self.fp + self.fn)
+
+
 class CrossEntropyLossFlatImageTypeWeighted:
     """
     Weighted cross-entropy loss for segmentation that supports:
@@ -165,24 +301,73 @@ class CrossEntropyLossFlatImageTypeWeighted:
 
 class EarlyStoppingRecall(Callback):
     """
-    Early stopping based on RecallMulti with patience.
-    Stops training if recall doesn't improve for N epochs.
+    Phase-aware early stopping based on RecallMulti with separate patience for frozen and unfrozen phases.
+    
+    This callback:
+    - Maintains separate patience counters for frozen and unfrozen training phases
+    - Tracks a single global best metric across both phases
+    - Frozen phase early stop terminates only the frozen phase (continues to unfrozen)
+    - Unfrozen phase early stop terminates the entire fine_tune process
+    
+    Args:
+        monitor: Metric name to monitor for early stopping (default: 'recall_multi_strip')
+        frozen_patience: Patience for frozen phase (default: 3)
+        unfrozen_patience: Patience for unfrozen phase (default: 3)
+        min_delta: Minimum improvement to consider as improvement (default: 0.001)
     """
     order = 60 # Run after Recorder
 
-    def __init__(self, monitor: str = 'recall_multi_strip', patience: int = 3, min_delta: float = 0.001):
+    def __init__(self, monitor: str = 'recall_multi_strip', frozen_patience: int = 3, 
+                 unfrozen_patience: int = 3, min_delta: float = 0.001):
         self.monitor = monitor
-        self.patience = patience
+        self.frozen_patience = frozen_patience
+        self.unfrozen_patience = unfrozen_patience
         self.min_delta = min_delta
-        self.best_value = -np.inf
-        self.patience_counter = 0
-        self.best_epoch = 0
-        logger.debug(f"[EarlyStoppingRecall] Initialized with monitor='{monitor}', patience={patience}")
+        
+        # Global best tracking (shared across both phases)
+        self.global_best_value = -np.inf
+        self.global_best_epoch = 0
+        
+        # Phase-specific patience counters
+        self.phase_states = {
+            "frozen": {
+                "patience": frozen_patience,
+                "counter": 0
+            },
+            "unfrozen": {
+                "patience": unfrozen_patience,
+                "counter": 0
+            }
+        }
+        
+        # Track last phase for logging transitions
+        self.last_phase = None
+        self._evaluation_mode = False  # Guard: prevent saves during evaluation
+        logger.debug(f"[EarlyStoppingRecall] Initialized with monitor='{monitor}', "
+                    f"frozen_patience={frozen_patience}, unfrozen_patience={unfrozen_patience}")
     
     def after_epoch(self):
+        """Called after epoch at the end of each epoch."""
+        # CRITICAL: Skip during evaluation to prevent early stopping during get_preds()
+        if getattr(self, '_evaluation_mode', False):
+            logger.debug(f"[EarlyStoppingRecall] Evaluation mode ACTIVE - skipping early stop check")
+            return
+        
         # DIAGNOSTIC: Log recorder state
         logger.debug(f"[EarlyStoppingRecall] after_epoch called at epoch {self.epoch}")
         logger.debug(f"  self.monitor = '{self.monitor}'")
+        
+        # Determine current phase based on optimizer frozen_idx
+        # frozen_idx > 0 means some layers are frozen (frozen phase)
+        # frozen_idx == 0 means all layers are trainable (unfrozen phase)
+        phase = "frozen" if self.learn.opt.frozen_idx > 0 else "unfrozen"
+        
+        # Log phase transitions
+        if phase != self.last_phase:
+            logger.info(f"[EarlyStoppingRecall] Switched to {phase} phase")
+            self.last_phase = phase
+        
+        logger.debug(f"  Current phase: {phase} (frozen_idx={self.learn.opt.frozen_idx})")
         
         # Get the current metric value from recorder
         # Check if values list is not empty (may be empty before validation completes)
@@ -218,18 +403,52 @@ class EarlyStoppingRecall(Callback):
         current_value = current_epoch_metrics[values_idx]
         logger.debug(f"  current_value = {current_value}")
         
-        # Check if this is an improvement
-        if current_value > self.best_value + self.min_delta:
-            self.best_value = current_value
-            self.patience_counter = 0
-            self.best_epoch = self.epoch
-        else:
-            self.patience_counter += 1
+        # Validate metric value (NaN / Inf checks)
+        if not isinstance(current_value, (int, float)):
+            logger.debug(f"  WARNING: Metric is not a number: {type(current_value)}")
+            return
         
-        # Stop if patience exceeded
-        if self.patience_counter >= self.patience:
-            logger.info(f"\nEarly stopping at epoch {self.epoch}. Best {self.monitor}: {self.best_value:.4f} at epoch {self.best_epoch}")
-            raise CancelFitException()
+        if np.isnan(current_value) or np.isinf(current_value):
+            logger.debug(f"  WARNING: Invalid metric value at epoch {self.epoch}: {current_value}")
+            return
+        
+        # Check if this is an improvement (compared to global best)
+        if current_value > self.global_best_value + self.min_delta:
+            # Update global best
+            old_best_value = self.global_best_value
+            old_best_epoch = self.global_best_epoch
+            self.global_best_value = current_value
+            self.global_best_epoch = self.epoch
+            
+            # Reset patience counter ONLY for current phase
+            self.phase_states[phase]["counter"] = 0
+            
+            logger.info(f"  📈 New global best {self.monitor}: {current_value:.6f} at epoch {self.epoch} (phase={phase})")
+            logger.debug(f"  📊 Previous best: {old_best_value:.6f} at epoch {old_best_epoch}")
+            logger.debug(f"  🔍 Reset patience counter for {phase} phase")
+        else:
+            # Increment patience counter for current phase
+            self.phase_states[phase]["counter"] += 1
+            logger.debug(f"  No improvement. {phase} phase patience counter: "
+                        f"{self.phase_states[phase]['counter']}/{self.phase_states[phase]['patience']}")
+        
+        # Check if patience exceeded for current phase
+        phase_counter = self.phase_states[phase]["counter"]
+        phase_patience = self.phase_states[phase]["patience"]
+        
+        if phase_counter >= phase_patience:
+            if phase == "frozen":
+                # Frozen phase stop: terminate frozen training only
+                logger.info(f"\n[EarlyStoppingRecall] Frozen phase early stopping at epoch {self.epoch}. "
+                           f"Best {self.monitor}: {self.global_best_value:.4f} at epoch {self.global_best_epoch}")
+                logger.info(f"[EarlyStoppingRecall] Terminating frozen phase, continuing to unfrozen phase...")
+                raise CancelTrainException()
+            else:
+                # Unfrozen phase stop: terminate entire training
+                logger.info(f"\n[EarlyStoppingRecall] Unfrozen phase early stopping at epoch {self.epoch}. "
+                           f"Best {self.monitor}: {self.global_best_value:.4f} at epoch {self.global_best_epoch}")
+                logger.info(f"[EarlyStoppingRecall] Terminating entire fine_tune process...")
+                raise CancelFitException()
 
 
 class MetricLogger(Callback):
@@ -243,9 +462,15 @@ class MetricLogger(Callback):
         self.class_names = class_names
         self.log_file = log_file
         self.epoch_logs = []
+        self._evaluation_mode = False  # Guard: prevent saves during evaluation
 
     def after_epoch(self):
         """Log metrics after each epoch"""
+        # CRITICAL: Skip during evaluation
+        if getattr(self, '_evaluation_mode', False):
+            logger.debug(f"[MetricLogger] Evaluation mode ACTIVE - skipping metric logging")
+            return
+        
         # DIAGNOSTIC: Log recorder state
         logger.debug(f"[MetricLogger] after_epoch called at epoch {self.epoch}")
         
@@ -288,6 +513,28 @@ class MetricLogger(Callback):
                     epoch_log['recall'] = values[values_idx]
                 else:
                     logger.debug(f"  WARNING: values_idx {values_idx} out of bounds for recall_multi_strip")
+
+            # Log precision if available
+            if 'precision_multi_strip' in metric_names:
+                precision_idx = metric_names.index('precision_multi_strip')
+                # Adjust index: metric_names includes 'epoch' at index 0, but values doesn't
+                values_idx = precision_idx - 1
+                logger.debug(f"  precision_multi_strip: metric_idx={precision_idx}, values_idx={values_idx}")
+                if values_idx >= 0 and values_idx < len(values):
+                    epoch_log['precision'] = values[values_idx]
+                else:
+                    logger.debug(f"  WARNING: values_idx {values_idx} out of bounds for precision_multi_strip")
+
+            # Log IoU if available
+            if 'iou_multi_strip' in metric_names:
+                iou_idx = metric_names.index('iou_multi_strip')
+                # Adjust index: metric_names includes 'epoch' at index 0, but values doesn't
+                values_idx = iou_idx - 1
+                logger.debug(f"  iou_multi_strip: metric_idx={iou_idx}, values_idx={values_idx}")
+                if values_idx >= 0 and values_idx < len(values):
+                    epoch_log['iou'] = values[values_idx]
+                else:
+                    logger.debug(f"  WARNING: values_idx {values_idx} out of bounds for iou_multi_strip")
 
             # Log composite score if available
             if 'composite_score' in metric_names:
@@ -431,28 +678,50 @@ def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) 
 
 class CompositeMetricCallback(Callback):
     """
-    Callback that computes a composite metric combining Dice and Recall.
-    Uses 30% Dice + 70% Recall to prioritize minimizing false negatives.
+    Callback that computes a composite metric combining Dice, Recall, and Precision.
+
+    Uses 30% Dice + 50% Recall + 20% Precision to balance:
+    - Recall prioritization (minimize false negatives)
+    - Precision guardrail (minimize false positives)
+    - Dice score (overall segmentation quality)
 
     This callback:
-    - Computes composite_score = 0.3 * dice_multi_strip + 0.7 * recall_multi_strip
+    - Computes composite_score = 0.3 * dice + 0.5 * recall + 0.2 * precision
+    - Applies precision guardrail: models with precision < min_precision are penalized
     - Stores the composite score in recorder for use by other callbacks
     - Logs the composite score for monitoring
 
     Args:
         dice_weight: Weight for dice metric (default: 0.3)
-        recall_weight: Weight for recall metric (default: 0.7)
+        recall_weight: Weight for recall metric (default: 0.5)
+        precision_weight: Weight for precision metric (default: 0.2)
+        min_precision: Minimum precision threshold for guardrail (default: 0.5)
+            Models with precision below this threshold receive a penalty to their score
     """
 
-    order = 60  # Run AFTER Recorder (50) but BEFORE SaveBest (70)
+    order = 55  # Run AFTER Recorder (50) but BEFORE EarlyStoppingRecall (60) and SaveBest (70)
 
-    def __init__(self, dice_weight: float = 0.3, recall_weight: float = 0.7):
+    def __init__(
+        self,
+        dice_weight: float = 0.3,
+        recall_weight: float = 0.5,
+        precision_weight: float = 0.2,
+        min_precision: float = 0.5
+    ):
         self.dice_weight = dice_weight
         self.recall_weight = recall_weight
+        self.precision_weight = precision_weight
+        self.min_precision = min_precision
+        self._evaluation_mode = False  # Guard: prevent saves during evaluation
         store_attr()
 
     def after_epoch(self):
         """Called after epoch at the end of each epoch."""
+        # CRITICAL: Skip during evaluation to prevent unnecessary metric computation
+        if getattr(self, '_evaluation_mode', False):
+            logger.debug(f"[CompositeMetricCallback] Evaluation mode ACTIVE - skipping")
+            return
+        
         # DIAGNOSTIC: Log recorder state
         logger.debug(f"[CompositeMetricCallback] after_epoch called at epoch {self.learn.epoch}")
 
@@ -474,13 +743,14 @@ class CompositeMetricCallback(Callback):
             logger.debug(f"  latest_values = {latest_values}")
             logger.debug(f"  len(latest_values) = {len(latest_values)}")
 
-            if latest_values is None or len(latest_values) < 4:
-                logger.debug(f"  ERROR: Not enough values in latest_values (need at least 4, got {len(latest_values)})")
+            if latest_values is None or len(latest_values) < 5:
+                logger.debug(f"  ERROR: Not enough values in latest_values (need at least 5, got {len(latest_values)})")
                 return
 
-            # Get dice and recall values using metric_names for robustness
+            # Get dice, recall, and precision values using metric_names for robustness
             dice_value = None
             recall_value = None
+            precision_value = None
 
             if metric_names is not None:
                 if 'dice_multi_strip' in metric_names:
@@ -502,35 +772,65 @@ class CompositeMetricCallback(Callback):
                         recall_value = latest_values[values_idx]
                     else:
                         logger.debug(f"  WARNING: values_idx {values_idx} out of bounds for recall_multi_strip")
+
+                if 'precision_multi_strip' in metric_names:
+                    precision_idx = metric_names.index('precision_multi_strip')
+                    # Adjust index: metric_names includes 'epoch' at index 0, but values doesn't
+                    values_idx = precision_idx - 1
+                    logger.debug(f"  precision_multi_strip: metric_idx={precision_idx}, values_idx={values_idx}")
+                    if values_idx >= 0 and values_idx < len(latest_values):
+                        precision_value = latest_values[values_idx]
+                    else:
+                        logger.debug(f"  WARNING: values_idx {values_idx} out of bounds for precision_multi_strip")
             else:
-                # Fallback: assume format [train_loss, valid_loss, dice_multi_strip, recall_multi_strip, ...]
+                # Fallback: assume format [train_loss, valid_loss, dice_multi_strip, recall_multi_strip, precision_multi_strip, ...]
                 logger.debug(f"  WARNING: metric_names is None, using hardcoded indices")
                 dice_value = latest_values[2]
                 recall_value = latest_values[3]
-                logger.debug(f"  Using hardcoded indices: dice=[2], recall=[3]")
+                precision_value = latest_values[4]
+                logger.debug(f"  Using hardcoded indices: dice=[2], recall=[3], precision=[4]")
 
-            if dice_value is None or recall_value is None:
-                logger.debug(f"  ERROR: Could not extract dice_value or recall_value")
+            if dice_value is None or recall_value is None or precision_value is None:
+                logger.debug(f"  ERROR: Could not extract dice_value, recall_value, or precision_value")
                 return
 
-            logger.debug(f"  dice_value = {dice_value}, recall_value = {recall_value}")
+            logger.debug(f"  dice_value = {dice_value}, recall_value = {recall_value}, precision_value = {precision_value}")
 
             # Check if values are valid
             if not (isinstance(dice_value, (int, float)) and
-                    isinstance(recall_value, (int, float))):
-                logger.debug(f"  ERROR: dice_value or recall_value is not a number")
+                    isinstance(recall_value, (int, float)) and
+                    isinstance(precision_value, (int, float))):
+                logger.debug(f"  ERROR: dice_value, recall_value, or precision_value is not a number")
                 return
 
             if np.isnan(dice_value) or np.isinf(dice_value) or \
-               np.isnan(recall_value) or np.isinf(recall_value):
-                logger.debug(f"  ERROR: dice_value or recall_value is NaN or Inf")
+               np.isnan(recall_value) or np.isinf(recall_value) or \
+               np.isnan(precision_value) or np.isinf(precision_value):
+                logger.debug(f"  ERROR: dice_value, recall_value, or precision_value is NaN or Inf")
                 return
 
             # Compute composite score
             composite_score = (self.dice_weight * dice_value +
-                            self.recall_weight * recall_value)
+                            self.recall_weight * recall_value +
+                            self.precision_weight * precision_value)
 
-            logger.debug(f"  composite_score = {composite_score:.6f} (dice_weight={self.dice_weight}, recall_weight={self.recall_weight})")
+            # Apply precision guardrail: if precision is below threshold, apply penalty
+            adjusted_score = composite_score
+            precision_warning = None
+
+            if precision_value < self.min_precision:
+                # Soft penalty: reduce score proportionally to how far below threshold
+                penalty_factor = precision_value / self.min_precision
+                adjusted_score = composite_score * penalty_factor
+                precision_warning = (
+                    f"⚠️ PRECISION GUARDRAIL: Precision ({precision_value:.4f}) below threshold "
+                    f"({self.min_precision:.2f}). Penalty applied: {penalty_factor:.4f}x"
+                )
+                logger.warning(f"[CompositeMetricCallback] {precision_warning}")
+
+            logger.debug(f"  composite_score = {composite_score:.6f} (dice_weight={self.dice_weight}, recall_weight={self.recall_weight}, precision_weight={self.precision_weight})")
+            if adjusted_score != composite_score:
+                logger.debug(f"  adjusted_score = {adjusted_score:.6f} (penalty applied)")
 
             # CRITICAL FIX: Add composite_score to recorder values and metric_names
             # This is needed for other callbacks to see it and for it to be displayed
@@ -538,8 +838,10 @@ class CompositeMetricCallback(Callback):
 
             # Add to metric_names if not already present
             if metric_names is not None and 'composite_score' not in metric_names:
-                # Find where to insert (after recall_multi_strip, before 'time')
-                if 'recall_multi_strip' in metric_names:
+                # Find where to insert (after precision_multi_strip, before 'time')
+                if 'precision_multi_strip' in metric_names:
+                    insert_idx = metric_names.index('precision_multi_strip') + 1
+                elif 'recall_multi_strip' in metric_names:
                     insert_idx = metric_names.index('recall_multi_strip') + 1
                 else:
                     insert_idx = len(metric_names) - 1  # Insert before 'time'
@@ -561,18 +863,21 @@ class CompositeMetricCallback(Callback):
                         latest_values.append(None)
                     logger.debug(f"  Extended latest_values to length {len(latest_values)}")
 
-                # Set the composite score
-                latest_values[values_idx] = composite_score
-                logger.debug(f"  Set latest_values[{values_idx}] = {composite_score}")
+                # Set the composite score (use adjusted score if penalty was applied)
+                latest_values[values_idx] = adjusted_score
+                logger.debug(f"  Set latest_values[{values_idx}] = {adjusted_score}")
                 logger.debug(f"  Updated latest_values = {latest_values}")
 
-            logger.info(
-                f"  📊 Composite Score: {composite_score:.6f} "
-                f"(Dice: {dice_value:.6f}, Recall: {recall_value:.6f})"
-            )
+            # Log the composite score with precision warning if applicable
+            score_msg = f"  📊 Composite Score: {adjusted_score:.6f} (Dice: {dice_value:.6f}, Recall: {recall_value:.6f}, Precision: {precision_value:.6f})"
+            if precision_warning:
+                score_msg = f"{score_msg}\n  {precision_warning}"
+            logger.info(score_msg)
 
         except Exception as e:
             logger.error(f"Error in CompositeMetricCallback at epoch {self.learn.epoch}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class ReduceLROnPlateauCustom(Callback):
@@ -609,6 +914,7 @@ class ReduceLROnPlateauCustom(Callback):
         self.wait = 0
         self.best_score = None
         self.lr_reduced_count = 0
+        self._evaluation_mode = False  # Guard: prevent saves during evaluation
         store_attr()
 
         if mode == 'max':
@@ -620,6 +926,11 @@ class ReduceLROnPlateauCustom(Callback):
 
     def after_epoch(self):
         """Called after epoch at the end of each epoch."""
+        # CRITICAL: Skip during evaluation to prevent LR adjustments during get_preds()
+        if getattr(self, '_evaluation_mode', False):
+            logger.debug(f"[ReduceLROnPlateauCustom] Evaluation mode ACTIVE - skipping LR reduction check")
+            return
+        
         # DIAGNOSTIC: Log recorder state
         logger.debug(f"[ReduceLROnPlateauCustom] after_epoch called at epoch {self.learn.epoch}")
         logger.debug(f"  self.monitor = '{self.monitor}'")
@@ -750,6 +1061,11 @@ class SaveBestAndLatestModel(Callback):
 
     def after_epoch(self):
         """Called after epoch at the end of each epoch."""
+        # CRITICAL: Skip during evaluation to prevent file locks during get_preds()
+        if getattr(self, '_evaluation_mode', False):
+            logger.debug(f"[SaveBestAndLatestModel] Evaluation mode ACTIVE - skipping save")
+            return
+        
         # DIAGNOSTIC: Log recorder state
         logger.debug(f"[SaveBestAndLatestModel] after_epoch called at epoch {self.learn.epoch}")
         logger.debug(f"  self.monitor = '{self.monitor}'")
@@ -828,16 +1144,29 @@ class SaveBestAndLatestModel(Callback):
             if current_score > self.best_score:
                 old_best_score = self.best_score
                 old_best_epoch = self.best_epoch
+                
+                # Determine current phase for logging
+                phase = "frozen" if self.learn.opt.frozen_idx > 0 else "unfrozen"
+                
                 # CRITICAL: Save model state BEFORE updating best_score/epoch
                 # This ensures we capture the correct model state for the new best score
                 self.best_model_state = {k: v.cpu().clone() for k, v in self.learn.model.state_dict().items()}
                 # Now update the tracking variables
                 self.best_score = current_score
                 self.best_epoch = self.learn.epoch
-                logger.info(f"  📈 New best model saved at epoch {self.learn.epoch} with {self.monitor}={current_score:.6f}")
+                logger.info(f"  📈 New best model saved at epoch {self.learn.epoch} (phase={phase}) with {self.monitor}={current_score:.6f}")
                 logger.debug(f"  📊 Previous best: epoch {old_best_epoch}, {self.monitor}={old_best_score:.6f}")
                 logger.debug(f"  🔍 Callback instance id={id(self)}, _already_saved={getattr(self, '_already_saved', False)}")
                 logger.debug(f"  🔧 Model state captured: {len(self.best_model_state)} parameters")
+                
+                # Optional: Save temporary checkpoint for crash-safety
+                # This prevents loss of best weights if training crashes mid-run
+                if self.learner_save_name:
+                    try:
+                        self.learn.save(f"{self.learner_save_name}_best_tmp")
+                        logger.debug(f"  💾 Saved temporary checkpoint: {self.learner_save_name}_best_tmp")
+                    except Exception as e:
+                        logger.debug(f"  ⚠️ Failed to save temporary checkpoint: {e}")
 
         except Exception as e:
             logger.error(f"Error in after_epoch at epoch {self.learn.epoch}: {e}")
