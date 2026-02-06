@@ -171,7 +171,12 @@ def load_model(
     dtype: torch.dtype = torch.float32,
 ) -> torch.nn.Module:
     """Load a PyTorch model from a file and move it to the
-    specified device and dtype."""
+    specified device and dtype.
+    
+    Note:
+        This function does NOT change the model's mode (train/eval).
+        The caller is responsible for setting the appropriate mode.
+    """
     model_path = Path(model_path)
     if not model_path.is_file():
         raise FileNotFoundError(f"Model file not found at: {model_path}")
@@ -181,7 +186,7 @@ def load_model(
     except Exception as e:
         raise RuntimeError(f"Error loading model: {e}") from None
 
-    model.eval()
+    # Removed model.eval() - caller should set mode explicitly
     return model.to(device=device, dtype=dtype)
 
 
@@ -276,6 +281,10 @@ def load_weights(
         
     Returns:
         The model with loaded weights
+        
+    Note:
+        This function does NOT change the model's mode (train/eval).
+        The caller is responsible for setting the appropriate mode.
     """
     weights_path = Path(weights_path)
     if weights_path.suffix == ".safetensors":
@@ -288,7 +297,7 @@ def load_weights(
         )
 
     model.load_state_dict(model_state, strict=strict)
-    model.eval()
+    # Removed model.eval() - caller should set mode explicitly
 
     if device is not None or dtype is not None:
         model = model.to(device=device, dtype=dtype)
@@ -311,7 +320,12 @@ def load_model_from_weights(
     compile_mode: str = "default",
     encoder_weights: Optional[str] = None,
 ) -> torch.nn.Module:
-    """Build model and load weights from file"""
+    """Build model and load weights from file for inference.
+    
+    Note:
+        This function is primarily used for inference, so it sets
+        the model to eval mode after loading weights.
+    """
     model = build_model(
         model_name=model_name,
         model_library=model_library,
@@ -327,6 +341,9 @@ def load_model_from_weights(
         dtype=dtype,
         strict=True
     )
+    
+    # Set to eval mode for inference
+    model.eval()
 
     if compile_models:
         model = compile_torch_model(

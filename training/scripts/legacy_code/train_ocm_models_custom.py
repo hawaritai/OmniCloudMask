@@ -36,6 +36,8 @@ import timm
 from rasterio.enums import Resampling
 from rasterio.errors import NotGeoreferencedWarning
 from training.scripts.custom_model_utils import build_custom_model, load_custom_weights
+# Import manual freezing utilities
+from training.scripts.freezing_utils import freeze_encoder, unfreeze_all, get_lr_ranges, print_frozen_status
 # Local imports from training/
 try:
     from augs import (
@@ -52,6 +54,7 @@ try:
     )
     from utils import (
         DiceMultiStrip,
+        PhaseTracker,  # Add PhaseTracker for reliable phase detection
         CrossEntropyLossFlatImageTypeWeighted,
     )
     from helpers import plot_batch, show_histo, print_system_info
@@ -170,12 +173,19 @@ def main():
         try:
             load_custom_weights(model, pretrained_weights_path, strict=False)
             logger.info("Successfully loaded pretrained weights.")
+            
+            # Set model to train mode for training
+            model.train()
+            logger.info("Model set to train mode for training.")
         except Exception as e:
             logger.error(f"Error loading pretrained weights: {e}")
             logger.info("Continuing with ImageNet weights (from timm)...")
     else:
         logger.warning(f"Warning: Pretrained weights not found at {pretrained_weights_path}")
         logger.info("Continuing with ImageNet weights (from timm)...")
+        
+        # Ensure model is in train mode even without pretrained weights
+        model.train()
 
     # Dummy Input Check
     dummy_input = torch.randn(
@@ -380,10 +390,12 @@ def main():
 
     # --- TRAINING ---
     callbacks = [
+        PhaseTracker(log_transitions=True),  # Add PhaseTracker for reliable phase detection
         GradientAccumulation(gradient_accumulation_batch_size),
     ]
 
     logger.info("Initializing Learner...")
+    model.train()
     learner = Learner(
         dls=dl,
         model=model,
@@ -396,10 +408,27 @@ def main():
         learner = learner.to_bf16()
 
     logger.info(f"Starting Fine Tuning: Freeze {freeze_epochs}, Unfreeze {unfrozen_epochs}")
-    learner.fine_tune(
-        epochs=unfrozen_epochs,
-        freeze_epochs=freeze_epochs,
-        base_lr=learning_rate,
+    
+    # Phase 1: Train with frozen encoder
+    logger.info(f"\n{'='*60}")
+    logger.info("Phase 1: Training with frozen encoder")
+    logger.info(f"{'='*60}")
+    freeze_encoder(learner)
+    print_frozen_status(learner)
+    learner.fit_one_cycle(
+        freeze_epochs,
+        get_lr_ranges(freeze_encoder=True)
+    )
+    
+    # Phase 2: Train with unfrozen encoder
+    logger.info(f"\n{'='*60}")
+    logger.info("Phase 2: Training with unfrozen encoder (discriminative LRs)")
+    logger.info(f"{'='*60}")
+    unfreeze_all(learner)
+    print_frozen_status(learner)
+    learner.fit_one_cycle(
+        unfrozen_epochs,
+        get_lr_ranges(freeze_encoder=False)
     )
 
     # --- SAVING ---

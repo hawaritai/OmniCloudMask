@@ -6,20 +6,26 @@ and performs fine-tuning on each one using the training data defined in local_co
 It uses the training methodology from train_ocm_models_custom.py with the modern
 model loading mechanism from compare_ocm_models.py for full v4 'smp' compatibility.
 
-RECALL-FOCUSED TRAINING STRATEGY WITH PRECISION GUARDRAIL:
+BALANCED TRAINING STRATEGY (FIXED - Reduced False Positives):
 - Primary goal: Minimize false negatives (critical for application)
-- Secondary goal: Minimize false positives (precision guardrail)
-- Metric weighting: 30% Dice + 50% Recall + 20% Precision
-  - Recall prioritized (50%) to minimize false negatives
-  - Precision included (20%) to guard against excessive false positives
+- Secondary goal: Minimize false positives (balanced approach)
+- Metric weighting: 30% Dice + 35% Recall + 35% Precision
+  - Recall and precision balanced equally (35% each) to reduce false positives
   - Dice score (30%) for overall segmentation quality
-- Class weights: [Clear=0.5, Thick Cloud=2.0, Thin Cloud=3.0, Cloud Shadow=3.0]
+  - Previous: 50% Recall + 20% Precision (too recall-focused, caused excessive false positives)
+- Class weights: [Clear=1.0, Thick Cloud=1.5, Thin Cloud=2.0, Cloud Shadow=2.0]
+  - Balanced 2:1 ratio (Critical:Clear) - Previous was 6:1 (too aggressive)
+  - Still prioritizes critical classes but prevents over-prediction
+  - Previous: [0.5, 2.0, 3.0, 3.0] - caused model to over-predict critical classes
 - Critical classes: Thin Cloud and Cloud Shadow (highest priority)
 - Leniency: Thin Cloud can be detected as Thick Cloud, but NO leniency for Cloud Shadow
-- Model selection: Based on composite score (30% Dice + 50% Recall + 20% Precision)
-- Precision guardrail: Models with precision < 0.5 receive a penalty to their composite score
-- Early stopping: Monitors recall_multi_strip with patience=5
-- Logging: Per-class metrics tracked via MetricLogger callback (now includes precision and IoU)
+- Model selection: Based on composite score (30% Dice + 35% Recall + 35% Precision)
+- Precision guardrail: Models with precision < 0.6 are rejected (score set to 0.0)
+  - Previous: Proportional penalty (too weak to counteract recall bias)
+  - Current: Hard threshold - completely rejects low precision models
+- Early stopping: Monitors composite_score (includes precision in decision)
+  - Previous: Monitored recall_multi_strip (ignored precision degradation)
+- Logging: Per-class metrics tracked via MetricLogger callback (includes precision and IoU)
 
 IMPROVEMENTS:
 - Output filenames preserve unique identifiers from checkpoint names (no overwriting)
@@ -28,11 +34,16 @@ IMPROVEMENTS:
 - Better error checking for safetensors file integrity
 - Automatic best model tracking: Saves both best and latest models during training
   - Best model is selected based on composite_score metric (higher is better)
-  - Composite score = 0.3 * dice + 0.5 * recall + 0.2 * precision
-  - Precision guardrail: If precision < 0.5, score is penalized proportionally
+  - Composite score = 0.3 * dice + 0.35 * recall + 0.35 * precision
+  - Precision guardrail: If precision < 0.6, score is set to 0.0 (hard rejection)
   - Prevents overfitting by preserving the best performing model
   - Both models are saved in safetensors and fastai learner formats
 - FIXED: Windows file locking issues with proper cleanup and retry logic
+- FIXED (2025-02-05): Reduced false positives by:
+  - Balancing composite score weights (35% recall, 35% precision)
+  - Reducing class weight ratio from 6:1 to 2:1
+  - Implementing hard precision guardrail (rejects models with precision < 0.6)
+  - Monitoring composite_score for early stopping (not just recall)
 - NEW: Added PrecisionMultiStrip and IoUMultiStrip metrics for comprehensive monitoring
 - NEW: Precision guardrail prevents models with too many false positives from being saved
 """
@@ -80,6 +91,8 @@ from rasterio.errors import NotGeoreferencedWarning
 
 # Import modern model loading utilities
 from custom_model_utils import build_custom_model, load_custom_weights
+# Import manual freezing utilities
+from freezing_utils import freeze_encoder, unfreeze_all, get_lr_ranges, print_frozen_status
 
 # Optional: Import compilation support for v4 models
 try:
@@ -109,6 +122,7 @@ try:
         PrecisionMultiStrip,
         IoUMultiStrip,
         CrossEntropyLossFlatImageTypeWeighted,
+        PhaseTracker,  # Add PhaseTracker for reliable phase detection
         EarlyStoppingRecall,
         MetricLogger,
         # Import utility functions and callbacks from utils.py
@@ -148,6 +162,36 @@ FASTAI_MODEL_TYPES = {
     'edgenext': 'edgenext_small.usi_in1k',
     'convnext': 'convnextv2_nano.fcmae_ft_in1k',
 }
+
+def create_learner(model, dls, callbacks, loss_func, metrics):
+    """Create learner without splitter - using manual freezing instead."""
+    model.train()
+    learner = Learner(
+        dls,
+        model,
+        loss_func=loss_func,
+        metrics=metrics,
+        cbs=callbacks
+    )
+    return learner
+
+def extract_version(name: str) -> float:
+    """
+    Extract OCM version from filename like PM_model_OCM_7.97_...
+    Returns 0.0 if not found.
+    """
+    match = re.search(r'OCM_(\d+\.\d+)', name)
+    return float(match.group(1)) if match else 0.0
+
+
+def architecture_priority(name: str) -> int:
+    name = name.lower()
+
+    if "edgenext" in name:
+        return 0   # highest priority
+    if "regnety" in name:
+        return 1
+    return 99      # fallback for unknown
 
 
 def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
@@ -205,7 +249,14 @@ def discover_model_checkpoints(ckpts_dir: Path) -> List[Dict]:
             'model_type': model_type,
             'model_library': model_library
         })
-    
+    # ---- Sort by OCM version (descending) ----
+    model_configs.sort(
+        key=lambda x: (
+            architecture_priority(x['name']),  # edgenext first
+            -extract_version(x['name'])        # version descending
+        )
+    )
+
     return model_configs
 
 
@@ -247,6 +298,10 @@ def load_model_for_training(
         # Load weights with device parameter
         load_custom_weights(model, checkpoint_path, device=DEVICE, strict=False)
         logger.info("  Successfully loaded checkpoint weights.")
+        
+        # Set model to train mode for training
+        model.train()
+        logger.info("  Model set to train mode for fine-tuning.")
         
         # Apply bfloat16 if requested
         if use_bf16 and DEVICE.type == 'cuda':
@@ -554,8 +609,13 @@ def fine_tune_single_model(
         
         # --- TRAINING ---
         callbacks = [
+            PhaseTracker(log_transitions=True),  # Add PhaseTracker first for reliable phase detection
             GradientAccumulation(training_config['gradient_accumulation_batch_size']),
-            CompositeMetricCallback(dice_weight=0.3, recall_weight=0.5, precision_weight=0.2, min_precision=0.6),
+            # FIXED: Balanced composite score weights to reduce false positives
+            # Previous: dice=0.3, recall=0.5, precision=0.2 - Too recall-focused
+            # Current: dice=0.3, recall=0.35, precision=0.35 - Equal weight on recall and precision
+            # This change balances false negative and false positive minimization
+            CompositeMetricCallback(dice_weight=0.3, recall_weight=0.35, precision_weight=0.35, min_precision=0.65),
             SaveBestAndLatestModel(
                 monitor='composite_score',
                 model_save_path=models_dir,
@@ -569,8 +629,12 @@ def fine_tune_single_model(
                 min_lr=1e-7,  # Minimum learning rate threshold
                 mode='max'  # Higher composite_score is better
             ),
+            # FIXED: Monitor composite_score instead of recall_multi_strip for early stopping
+            # This ensures training stops when the balanced metric plateaus, not just recall
+            # Previous: monitor='recall_multi_strip' - continued training despite low precision
+            # Current: monitor='composite_score' - stops when overall performance (including precision) plateaus
             EarlyStoppingRecall(
-                monitor='recall_multi_strip',
+                monitor='composite_score',
                 frozen_patience=1,  # Short patience for frozen phase (cloud segmentation improves quickly)
                 unfrozen_patience=3,  # Longer patience for unfrozen phase (encoder adaptation)
                 min_delta=0.001
@@ -578,15 +642,26 @@ def fine_tune_single_model(
         ]
 
         logger.info("Initializing Learner...")
-        learner = Learner(
-            dls=dl,
+        # learner = Learner(
+        #     dls=dl,
+        #     model=model,
+        #     loss_func=CrossEntropyLossFlatImageTypeWeighted(
+        #         class_weights=training_config['class_weights']
+        #     ),
+        #     metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
+        #     cbs=callbacks,
+        # )
+
+        learner = create_learner(
             model=model,
+            dls=dl,
+            callbacks=callbacks,
             loss_func=CrossEntropyLossFlatImageTypeWeighted(
                 class_weights=training_config['class_weights']
             ),
-            metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
-            cbs=callbacks,
+            metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip]
         )
+
 
         # Log callback instances
         logger.debug(f"🔧 Learner callbacks: {[type(cb).__name__ for cb in learner.cbs]}")
@@ -605,19 +680,35 @@ def fine_tune_single_model(
             f"Unfreeze {training_config['unfrozen_epochs']}"
         )
 
-        # Log callback state before fine_tune
+        # Log callback state before training
         if save_callback:
-            logger.debug(f"🔧 Before fine_tune: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
+            logger.debug(f"🔧 Before training: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
 
-        learner.fine_tune(
-            epochs=training_config['unfrozen_epochs'],
-            freeze_epochs=training_config['freeze_epochs'],
-            base_lr=training_config['learning_rate'],
+        # Phase 1: Train with frozen encoder
+        logger.info(f"\n{'='*60}")
+        logger.info("Phase 1: Training with frozen encoder")
+        logger.info(f"{'='*60}")
+        freeze_encoder(learner)
+        print_frozen_status(learner)
+        learner.fit_one_cycle(
+            training_config['freeze_epochs'],
+            get_lr_ranges(freeze_encoder=True)
+        )
+        
+        # Phase 2: Train with unfrozen encoder
+        logger.info(f"\n{'='*60}")
+        logger.info("Phase 2: Training with unfrozen encoder (discriminative LRs)")
+        logger.info(f"{'='*60}")
+        unfreeze_all(learner)
+        print_frozen_status(learner)
+        learner.fit_one_cycle(
+            training_config['unfrozen_epochs'],
+            get_lr_ranges(freeze_encoder=False)
         )
 
-        # Log callback state after fine_tune
+        # Log callback state after training
         if save_callback:
-            logger.debug(f"🔧 After fine_tune: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
+            logger.debug(f"🔧 After training: callback (id={id(save_callback)}) state: best_epoch={save_callback.best_epoch}, best_score={save_callback.best_score:.6f}, _already_saved={save_callback._already_saved}")
         
         # --- SAVING ---
         # Note: SaveBestAndLatestModel callback has already saved both best and latest models
@@ -857,14 +948,18 @@ def main():
         native_band_scales = [1, 1, 1]
     
     gradient_accumulation_batch_size = 128
-    batch_size = 10
+    batch_size = 6
     learning_rate = 0.0001
 
-    # Class weights for recall-focused training
+    # Class weights for balanced training (FIXED: reduced from 6:1 to 2:1 ratio)
     # [Clear, Thick Cloud, Thin Cloud, Cloud Shadow]
-    # Higher weights on Thin Cloud and Cloud Shadow to minimize false negatives
-    CLASS_WEIGHTS = torch.tensor([0.5, 2.0, 3.0, 3.0])
+    # Previous: [0.5, 2.0, 3.0, 3.0] - Too aggressive, caused excessive false positives
+    # Current: [1.0, 1.5, 2.0, 2.0] - Balanced 2:1 ratio, still prioritizes critical classes
+    # This change reduces false positives while maintaining good recall on critical classes
+    CLASS_WEIGHTS = torch.tensor([1.0, 1.5, 2.0, 2.0])
     logger.info(f"Class weights: {CLASS_WEIGHTS.tolist()}")
+    logger.info(f"  - Ratio: {CLASS_WEIGHTS[3]/CLASS_WEIGHTS[0]:.1f}:1 (Critical:Clear)")
+    logger.info(f"  - Previous ratio was 6:1, reduced to prevent over-prediction")
 
     my_custom_weight = 1.0
     
@@ -887,7 +982,7 @@ def main():
     else:
         # Default for custom fine-tuning: Increased epoch count with LR reduction on plateau
         # ReduceLROnPlateau callback will automatically reduce LR when model saturates
-        freeze_epochs = 2
+        freeze_epochs = 3
         unfrozen_epochs = 14
         limit_training_images = None
     
@@ -964,11 +1059,14 @@ def main():
     logger.info(f"Successful: {success_count}")
     logger.info(f"Failed: {failure_count}")
     logger.info(f"Output directory: {output_base_dir}")
-    logger.info(f"\nRECALL-FOCUSED TRAINING STRATEGY:")
-    logger.info(f"  - Class weights: [Clear=0.5, Thick Cloud=2.0, Thin Cloud=3.0, Cloud Shadow=3.0]")
-    logger.info(f"  - Composite metric: 30% Dice + 70% Recall")
-    logger.info(f"  - Model selection: Based on composite_score (prioritizes recall)")
-    logger.info(f"  - Early stopping: Monitors recall_multi_strip with patience=5")
+    logger.info(f"\nBALANCED TRAINING STRATEGY (FIXED - Reduced False Positives):")
+    logger.info(f"  - Class weights: [Clear=1.0, Thick Cloud=1.5, Thin Cloud=2.0, Cloud Shadow=2.0]")
+    logger.info(f"    Ratio: 2:1 (Critical:Clear) - Previous was 6:1 (too aggressive)")
+    logger.info(f"  - Composite metric: 30% Dice + 35% Recall + 35% Precision")
+    logger.info(f"    Previous: 30% Dice + 50% Recall + 20% Precision (too recall-focused)")
+    logger.info(f"  - Model selection: Based on composite_score (balanced recall & precision)")
+    logger.info(f"  - Early stopping: Monitors composite_score (includes precision)")
+    logger.info(f"  - Precision guardrail: Hard threshold (precision < 0.6 = score 0.0)")
     logger.info(f"\nPRIMARY OUTPUT FORMAT: .safetensors files")
     logger.info(f"All safetensors files have been integrity-verified")
     logger.info(f"\nFor each model, two versions are saved:")

@@ -129,6 +129,10 @@ class OCMTester:
         try:
             load_custom_weights(model, model_path, device=self.device, strict=False)
             logger.info("Model loaded successfully.")
+            
+            # Set model to eval mode for inference
+            model.eval()
+            logger.info("Model set to eval mode for inference.")
             return model
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights: {e}")

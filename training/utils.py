@@ -299,6 +299,126 @@ class CrossEntropyLossFlatImageTypeWeighted:
         return weighted_losses.mean()
 
 
+class PhaseTracker(Callback):
+    """
+    Automatically detects and tracks transitions between frozen and unfrozen phases.
+    
+    This callback monitors requires_grad status of model parameters to determine
+    current training phase:
+    - 'frozen': Some parameters are frozen (requires_grad=False)
+    - 'unfrozen': All parameters are trainable (requires_grad=True)
+    - 'fully_frozen': No parameters are trainable (edge case)
+    
+    The phase information is made available to other callbacks via:
+    - self.phase (current phase string)
+    - self.phase_info (dict with detailed information)
+    - learn.phase (attached to learner for easy access)
+    """
+    
+    order = 50  # Run BEFORE Recorder (50) and other callbacks
+    
+    def __init__(self, log_transitions: bool = True):
+        """
+        Args:
+            log_transitions: Whether to log phase transitions (default: True)
+        """
+        self.phase = "frozen"  # Default assumption
+        self.phase_info = {}
+        self.phase_changed_at_epoch = 0
+        self.log_transitions = log_transitions
+        self._evaluation_mode = False  # Guard: prevent saves during evaluation
+        
+    def _update_phase_info(self):
+        """
+        Update phase information by checking requires_grad status.
+        
+        Returns:
+            str: Current phase ('frozen', 'unfrozen', or 'fully_frozen')
+        """
+        # Count frozen and unfrozen parameters
+        frozen_count = sum(1 for p in self.learn.model.parameters() if not p.requires_grad)
+        total_count = sum(1 for _ in self.learn.model.parameters())
+        unfrozen_count = total_count - frozen_count
+        
+        # Determine phase based on parameter states
+        if frozen_count == 0:
+            phase = "unfrozen"
+        elif frozen_count == total_count:
+            phase = "fully_frozen"
+        else:
+            phase = "frozen"
+        
+        # Store detailed information
+        self.phase_info = {
+            "phase": phase,
+            "epoch": self.epoch,
+            "frozen_params": frozen_count,
+            "unfrozen_params": unfrozen_count,
+            "total_params": total_count,
+            "frozen_pct": (frozen_count / total_count * 100) if total_count > 0 else 0,
+            "unfrozen_pct": (unfrozen_count / total_count * 100) if total_count > 0 else 0,
+        }
+        
+        return phase
+    
+    def before_fit(self):
+        """Initialize phase tracking at start of training."""
+        self._update_phase_info()
+        self.phase = self.phase_info["phase"]
+        self.phase_changed_at_epoch = 0
+        
+        # Attach phase to learner for easy access by other callbacks
+        self.learn.phase = self.phase
+        self.learn.phase_info = self.phase_info
+        
+        if self.log_transitions:
+            logger.info(f"[PhaseTracker] Training started in phase: {self.phase.upper()}")
+            logger.info(f"[PhaseTracker] Frozen: {self.phase_info['frozen_params']:,}/{self.phase_info['total_params']:,} "
+                       f"({self.phase_info['frozen_pct']:.1f}%)")
+    
+    def after_epoch(self):
+        """Check for phase transitions after each epoch."""
+        # Skip during evaluation
+        if getattr(self, '_evaluation_mode', False):
+            return
+        
+        prev_phase = self.phase
+        new_phase = self._update_phase_info()
+        
+        # Detect phase transition
+        if new_phase != prev_phase:
+            self.phase = new_phase
+            self.phase_changed_at_epoch = self.epoch
+            
+            # Update learner reference
+            self.learn.phase = self.phase
+            self.learn.phase_info = self.phase_info
+            
+            if self.log_transitions:
+                logger.info(f"[PhaseTracker] 📊 PHASE TRANSITION: {prev_phase.upper()} → {new_phase.upper()} "
+                           f"at epoch {self.epoch}")
+                logger.info(f"[PhaseTracker] Frozen: {self.phase_info['frozen_params']:,}/{self.phase_info['total_params']:,} "
+                           f"({self.phase_info['frozen_pct']:.1f}%)")
+    
+    def get_phase(self) -> str:
+        """
+        Get current training phase.
+        
+        Returns:
+            str: Current phase ('frozen', 'unfrozen', or 'fully_frozen')
+        """
+        return self.phase
+    
+    def get_phase_info(self) -> dict:
+        """
+        Get detailed phase information.
+        
+        Returns:
+            dict: Dictionary with phase statistics
+        """
+        return self.phase_info
+
+
 class EarlyStoppingRecall(Callback):
     """
     Phase-aware early stopping based on RecallMulti with separate patience for frozen and unfrozen phases.
@@ -357,17 +477,16 @@ class EarlyStoppingRecall(Callback):
         logger.debug(f"[EarlyStoppingRecall] after_epoch called at epoch {self.epoch}")
         logger.debug(f"  self.monitor = '{self.monitor}'")
         
-        # Determine current phase based on optimizer frozen_idx
-        # frozen_idx > 0 means some layers are frozen (frozen phase)
-        # frozen_idx == 0 means all layers are trainable (unfrozen phase)
-        phase = "frozen" if self.learn.opt.frozen_idx > 0 else "unfrozen"
+        # Get current phase from PhaseTracker callback
+        # PhaseTracker uses requires_grad status to reliably detect phase
+        phase = getattr(self.learn, 'phase', 'unfrozen')
         
         # Log phase transitions
         if phase != self.last_phase:
             logger.info(f"[EarlyStoppingRecall] Switched to {phase} phase")
             self.last_phase = phase
         
-        logger.debug(f"  Current phase: {phase} (frozen_idx={self.learn.opt.frozen_idx})")
+        logger.debug(f"  Current phase: {phase}")
         
         # Get the current metric value from recorder
         # Check if values list is not empty (may be empty before validation completes)
@@ -489,7 +608,16 @@ class MetricLogger(Callback):
         epoch_log = {
             'epoch': self.epoch,
             'loss': values[0] if len(values) > 0 else None,
+            'phase': getattr(self.learn, 'phase', 'unknown'),
         }
+        
+        # Add phase information if available from PhaseTracker
+        if hasattr(self.learn, 'phase_info'):
+            phase_info = self.learn.phase_info
+            epoch_log['frozen_params'] = phase_info.get('frozen_params', 0)
+            epoch_log['unfrozen_params'] = phase_info.get('unfrozen_params', 0)
+            epoch_log['frozen_pct'] = phase_info.get('frozen_pct', 0.0)
+            epoch_log['unfrozen_pct'] = phase_info.get('unfrozen_pct', 0.0)
 
         # Try to get per-class metrics from recorder
         try:
@@ -680,23 +808,25 @@ class CompositeMetricCallback(Callback):
     """
     Callback that computes a composite metric combining Dice, Recall, and Precision.
 
-    Uses 30% Dice + 50% Recall + 20% Precision to balance:
-    - Recall prioritization (minimize false negatives)
-    - Precision guardrail (minimize false positives)
-    - Dice score (overall segmentation quality)
+    FIXED (2025-02-05): Balanced weights to reduce false positives
+    - Previous: 30% Dice + 50% Recall + 20% Precision (too recall-focused)
+    - Current: 30% Dice + 35% Recall + 35% Precision (balanced)
+    - This change balances false negative and false positive minimization
 
     This callback:
-    - Computes composite_score = 0.3 * dice + 0.5 * recall + 0.2 * precision
-    - Applies precision guardrail: models with precision < min_precision are penalized
+    - Computes composite_score = 0.3 * dice + 0.35 * recall + 0.35 * precision
+    - Applies precision guardrail: models with precision < min_precision are rejected (score = 0.0)
+      - Previous: Proportional penalty (too weak to counteract recall bias)
+      - Current: Hard threshold - completely rejects low precision models
     - Stores the composite score in recorder for use by other callbacks
     - Logs the composite score for monitoring
 
     Args:
         dice_weight: Weight for dice metric (default: 0.3)
-        recall_weight: Weight for recall metric (default: 0.5)
-        precision_weight: Weight for precision metric (default: 0.2)
-        min_precision: Minimum precision threshold for guardrail (default: 0.5)
-            Models with precision below this threshold receive a penalty to their score
+        recall_weight: Weight for recall metric (default: 0.35, was 0.5)
+        precision_weight: Weight for precision metric (default: 0.35, was 0.2)
+        min_precision: Minimum precision threshold for guardrail (default: 0.6, was 0.5)
+            Models with precision below this threshold receive score = 0.0 (hard rejection)
     """
 
     order = 55  # Run AFTER Recorder (50) but BEFORE EarlyStoppingRecall (60) and SaveBest (70)
@@ -704,9 +834,9 @@ class CompositeMetricCallback(Callback):
     def __init__(
         self,
         dice_weight: float = 0.3,
-        recall_weight: float = 0.5,
-        precision_weight: float = 0.2,
-        min_precision: float = 0.5
+        recall_weight: float = 0.35,
+        precision_weight: float = 0.35,
+        min_precision: float = 0.6
     ):
         self.dice_weight = dice_weight
         self.recall_weight = recall_weight
@@ -819,18 +949,21 @@ class CompositeMetricCallback(Callback):
             precision_warning = None
 
             if precision_value < self.min_precision:
-                # Soft penalty: reduce score proportionally to how far below threshold
-                penalty_factor = precision_value / self.min_precision
-                adjusted_score = composite_score * penalty_factor
+                # FIXED: Hard threshold penalty - completely reject low precision models
+                # Previous: Soft proportional penalty (penalty_factor = precision / min_precision)
+                # Current: Hard threshold - models with precision < min_precision get score = 0
+                # This prevents models with excessive false positives from being selected
+                adjusted_score = 0.0
                 precision_warning = (
                     f"⚠️ PRECISION GUARDRAIL: Precision ({precision_value:.4f}) below threshold "
-                    f"({self.min_precision:.2f}). Penalty applied: {penalty_factor:.4f}x"
+                    f"({self.min_precision:.2f}). Model rejected (score set to 0.0)."
                 )
                 logger.warning(f"[CompositeMetricCallback] {precision_warning}")
+                logger.info(f"[CompositeMetricCallback] Composite score: {composite_score:.6f} -> {adjusted_score:.6f}")
 
             logger.debug(f"  composite_score = {composite_score:.6f} (dice_weight={self.dice_weight}, recall_weight={self.recall_weight}, precision_weight={self.precision_weight})")
             if adjusted_score != composite_score:
-                logger.debug(f"  adjusted_score = {adjusted_score:.6f} (penalty applied)")
+                logger.debug(f"  adjusted_score = {adjusted_score:.6f} (hard penalty applied)")
 
             # CRITICAL FIX: Add composite_score to recorder values and metric_names
             # This is needed for other callbacks to see it and for it to be displayed
@@ -1004,7 +1137,7 @@ class ReduceLROnPlateauCustom(Callback):
                     new_lr = max(old_lr * self.factor, self.min_lr)
 
                     if new_lr < old_lr:
-                        self.learn.opt.set_hyper('lr', new_lr)
+                        self.learn.opt.set_hyper('lr', [new_lr])
                         self.lr_reduced_count += 1
                         self.wait = 0
                         logger.info(f"  ⚠️ Learning rate reduced from {old_lr:.2e} to {new_lr:.2e} (reduction #{self.lr_reduced_count})")
@@ -1145,8 +1278,9 @@ class SaveBestAndLatestModel(Callback):
                 old_best_score = self.best_score
                 old_best_epoch = self.best_epoch
                 
-                # Determine current phase for logging
-                phase = "frozen" if self.learn.opt.frozen_idx > 0 else "unfrozen"
+                # Get current phase from PhaseTracker callback
+                # PhaseTracker uses requires_grad status to reliably detect phase
+                phase = getattr(self.learn, 'phase', 'unfrozen')
                 
                 # CRITICAL: Save model state BEFORE updating best_score/epoch
                 # This ensures we capture the correct model state for the new best score
@@ -1383,3 +1517,72 @@ class SaveBestAndLatestModel(Callback):
             import traceback
             traceback.print_exc()
             # Don't raise exception to allow training to complete
+
+
+# --- HELPER FUNCTIONS FOR PHASE DETECTION ---
+
+def get_training_phase(learn) -> str:
+    """
+    Determine current training phase by checking parameter requires_grad status.
+    
+    This is a utility function for checking phase outside of PhaseTracker callback.
+    For automatic tracking during training, use PhaseTracker callback instead.
+    
+    Args:
+        learn: FastAI learner object
+        
+    Returns:
+        str: Current phase ('frozen', 'unfrozen', or 'fully_frozen')
+        
+    Example:
+        >>> phase = get_training_phase(learn)
+        >>> print(f"Current phase: {phase}")
+        Current phase: frozen
+    """
+    frozen_count = sum(1 for p in learn.model.parameters() if not p.requires_grad)
+    total_count = sum(1 for _ in learn.model.parameters())
+    
+    if frozen_count == 0:
+        return "unfrozen"
+    elif frozen_count == total_count:
+        return "fully_frozen"
+    else:
+        return "frozen"
+
+
+def analyze_frozen_layers(learn) -> dict:
+    """
+    Provides detailed breakdown of frozen vs unfrozen parameters and layers.
+    
+    Args:
+        learn: FastAI learner object
+        
+    Returns:
+        dict: Dictionary with layer-by-layer freezing information
+        
+    Example:
+        >>> stats = analyze_frozen_layers(learn)
+        >>> print(f"Frozen: {stats['frozen']:,} params ({stats['frozen_pct']:.1f}%)")
+        Frozen: 23,000,000 params (95.0%)
+    """
+    stats = {
+        "frozen": 0,
+        "unfrozen": 0,
+        "frozen_layers": [],
+        "unfrozen_layers": []
+    }
+    
+    for name, param in learn.model.named_parameters():
+        if param.requires_grad:
+            stats["unfrozen"] += param.numel()
+            stats["unfrozen_layers"].append(name)
+        else:
+            stats["frozen"] += param.numel()
+            stats["frozen_layers"].append(name)
+    
+    total = stats["frozen"] + stats["unfrozen"]
+    stats["frozen_pct"] = (stats["frozen"] / total * 100) if total > 0 else 0
+    stats["unfrozen_pct"] = (stats["unfrozen"] / total * 100) if total > 0 else 0
+    stats["total_params"] = total
+    
+    return stats
