@@ -636,31 +636,33 @@ def fine_tune_single_model(
             EarlyStoppingRecall(
                 monitor='composite_score',
                 frozen_patience=1,  # Short patience for frozen phase (cloud segmentation improves quickly)
-                unfrozen_patience=3,  # Longer patience for unfrozen phase (encoder adaptation)
+                unfrozen_patience=5,  # Longer patience for unfrozen phase (encoder adaptation)
                 min_delta=0.001
             ),
         ]
 
         logger.info("Initializing Learner...")
-        # learner = Learner(
-        #     dls=dl,
-        #     model=model,
-        #     loss_func=CrossEntropyLossFlatImageTypeWeighted(
-        #         class_weights=training_config['class_weights']
-        #     ),
-        #     metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
-        #     cbs=callbacks,
-        # )
-
-        learner = create_learner(
-            model=model,
+        
+        model.train()
+        learner = Learner(
             dls=dl,
-            callbacks=callbacks,
+            model=model,
             loss_func=CrossEntropyLossFlatImageTypeWeighted(
                 class_weights=training_config['class_weights']
             ),
-            metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip]
+            metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
+            cbs=callbacks,
         )
+
+        # learner = create_learner(
+        #     model=model,
+        #     dls=dl,
+        #     callbacks=callbacks,
+        #     loss_func=CrossEntropyLossFlatImageTypeWeighted(
+        #         class_weights=training_config['class_weights']
+        #     ),
+        #     metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip]
+        # )
 
 
         # Log callback instances
@@ -815,6 +817,12 @@ def fine_tune_single_model(
         
         logger.info(f"Evaluation mode enabled on {len(callbacks_with_eval_mode)} callbacks")
         
+        # Load best model for evaluation (learner currently has latest model)
+        # The SaveBestAndLatestModel callback saves best model but restores latest model state,
+        # so we need to explicitly load the best model before computing metrics
+        learner.load(f"{base_identifier}_best")
+        logger.info(f"  ✓ Loaded best model from epoch {best_epoch} for evaluation (composite_score={best_composite_score:.6f})")
+        
         try:
             logger.info("\nGenerating evaluation metrics...")
             
@@ -948,7 +956,7 @@ def main():
         native_band_scales = [1, 1, 1]
     
     gradient_accumulation_batch_size = 128
-    batch_size = 6
+    batch_size = 8
     learning_rate = 0.0001
 
     # Class weights for balanced training (FIXED: reduced from 6:1 to 2:1 ratio)
@@ -982,7 +990,7 @@ def main():
     else:
         # Default for custom fine-tuning: Increased epoch count with LR reduction on plateau
         # ReduceLROnPlateau callback will automatically reduce LR when model saturates
-        freeze_epochs = 3
+        freeze_epochs = 2
         unfrozen_epochs = 14
         limit_training_images = None
     

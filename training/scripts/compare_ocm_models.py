@@ -312,7 +312,7 @@ model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
 # models_dir = project_root / "ckpts"
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v9.1\models")
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2\models")
 bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
 
 if fine_tuned_models_dir.exists() or bsae_model_dir.exists():

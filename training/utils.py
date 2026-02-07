@@ -371,7 +371,7 @@ class PhaseTracker(Callback):
         self.learn.phase = self.phase
         self.learn.phase_info = self.phase_info
         
-        if self.log_transitions:
+        if self.log_transitions and not self._evaluation_mode:
             logger.info(f"[PhaseTracker] Training started in phase: {self.phase.upper()}")
             logger.info(f"[PhaseTracker] Frozen: {self.phase_info['frozen_params']:,}/{self.phase_info['total_params']:,} "
                        f"({self.phase_info['frozen_pct']:.1f}%)")
@@ -425,9 +425,18 @@ class EarlyStoppingRecall(Callback):
     
     This callback:
     - Maintains separate patience counters for frozen and unfrozen training phases
-    - Tracks a single global best metric across both phases
+    - Resets both patience counter AND global best metric when transitioning between phases
+    - Each phase starts fresh with its own baseline for comparison
     - Frozen phase early stop terminates only the frozen phase (continues to unfrozen)
     - Unfrozen phase early stop terminates the entire fine_tune process
+    
+    Example:
+        With frozen_patience=1 and unfrozen_patience=3:
+        - If epochs 1-3 are frozen and epochs 4-17 are unfrozen
+        - Frozen phase: Tracks best metric and patience independently (counter resets to -inf on phase change)
+        - Unfrozen phase: Starts fresh with best=-inf, first epoch becomes new baseline
+        - If frozen epochs 1-3 show no improvement, training continues to unfrozen (counter resets)
+        - Only after 3 consecutive unfrozen epochs with no improvement will training stop
     
     Args:
         monitor: Metric name to monitor for early stopping (default: 'recall_multi_strip')
@@ -461,7 +470,7 @@ class EarlyStoppingRecall(Callback):
         }
         
         # Track last phase for logging transitions
-        self.last_phase = None
+        self.last_phase = 'frozen'
         self._evaluation_mode = False  # Guard: prevent saves during evaluation
         logger.debug(f"[EarlyStoppingRecall] Initialized with monitor='{monitor}', "
                     f"frozen_patience={frozen_patience}, unfrozen_patience={unfrozen_patience}")
@@ -481,9 +490,15 @@ class EarlyStoppingRecall(Callback):
         # PhaseTracker uses requires_grad status to reliably detect phase
         phase = getattr(self.learn, 'phase', 'unfrozen')
         
-        # Log phase transitions
+        # Log phase transitions and reset counter on phase change
         if phase != self.last_phase:
             logger.info(f"[EarlyStoppingRecall] Switched to {phase} phase")
+            # Reset patience counter for the new phase
+            self.phase_states[phase]["counter"] = 0
+            # Reset global best value when phase changes
+            self.global_best_value = -np.inf
+            self.global_best_epoch = 0
+            logger.info(f"[EarlyStoppingRecall] Reset patience counter and global best for {phase} phase")
             self.last_phase = phase
         
         logger.debug(f"  Current phase: {phase}")
