@@ -636,7 +636,7 @@ def fine_tune_single_model(
             EarlyStoppingRecall(
                 monitor='composite_score',
                 frozen_patience=1,  # Short patience for frozen phase (cloud segmentation improves quickly)
-                unfrozen_patience=5,  # Longer patience for unfrozen phase (encoder adaptation)
+                unfrozen_patience=7,  # Longer patience for unfrozen phase (encoder adaptation)
                 min_delta=0.001
             ),
         ]
@@ -964,7 +964,7 @@ def main():
     # Previous: [0.5, 2.0, 3.0, 3.0] - Too aggressive, caused excessive false positives
     # Current: [1.0, 1.5, 2.0, 2.0] - Balanced 2:1 ratio, still prioritizes critical classes
     # This change reduces false positives while maintaining good recall on critical classes
-    CLASS_WEIGHTS = torch.tensor([1.0, 1.5, 2.0, 2.0])
+    CLASS_WEIGHTS = torch.tensor([1.0, 1.5, 2.0, 3.0])
     logger.info(f"Class weights: {CLASS_WEIGHTS.tolist()}")
     logger.info(f"  - Ratio: {CLASS_WEIGHTS[3]/CLASS_WEIGHTS[0]:.1f}:1 (Critical:Clear)")
     logger.info(f"  - Previous ratio was 6:1, reduced to prevent over-prediction")
@@ -1009,7 +1009,7 @@ def main():
         logger.info(f"  - {config['name']} ({config['model_library']}, {config['model_type']})")
     
     # --- OUTPUT DIRECTORY ---
-    output_base_dir = project_root / f"fine_tuning_results_{model_version}"
+    output_base_dir = project_root / "fine_tune_results" / f"fine_tuning_results_{model_version}"
     output_base_dir.mkdir(exist_ok=True)
     
     # --- FINE-TUNE EACH MODEL ---

@@ -19,32 +19,18 @@ MAX_SAVE_RETRIES = 3  # Maximum retry attempts for file operations
 SAVE_RETRY_DELAY = 0.5  # Delay between retries in seconds
 
 
-class DiceMultiStrip(DiceMulti):
-    """DiceMulti that only looks at the first element if y is a tuple"""
-
-    def accumulate(self, learn):
-        # Temporarily modify learn.yb (the underlying batch) instead of learn.y
-        yb_backup = learn.yb
-
-        # Extract targets if it's a tuple
-        if isinstance(learn.yb, (tuple, list)) and len(learn.yb) > 0:
-            if isinstance(learn.yb[0], (tuple, list)):
-                # If yb contains tuples, extract the first element of each tuple
-                learn.yb = (learn.yb[0][0],)  # Just the targets, keep it as a tuple
-            else:
-                learn.yb = (learn.yb[0],)  # Wrap in tuple to maintain structure
-
-        try:
-            # Call the parent accumulate method
-            super().accumulate(learn)
-        finally:
-            # Always restore the original yb
-            learn.yb = yb_backup
-
-
-
-class RecallMultiStrip(Metric):
-    """Recall metric for multi-class segmentation that only looks at the first element if y is a tuple"""
+class DiceMultiStrip(Metric):
+    """
+    Dice coefficient metric for multi-class segmentation that only looks at the first element if y is a tuple.
+    
+    FIXED: Uses macro-averaging to give equal weight to each class, regardless of pixel count.
+    This prevents the clear class (with many more pixels) from dominating the metric.
+    
+    Dice coefficient measures the overlap between predicted and actual masks.
+    Formula: Dice = 2*TP / (2*TP + FP + FN)
+    
+    Macro-averaging: Calculate Dice per class, then average across all classes.
+    """
 
     def __init__(self, axis=1):
         self.axis = axis
@@ -52,8 +38,10 @@ class RecallMultiStrip(Metric):
 
     def reset(self):
         """Reset metric state"""
-        self.tp = 0  # True positives
-        self.fn = 0  # False negatives
+        # Track TP, FP, and FN per class for macro-averaging
+        self.tp_per_class = None  # Will be initialized on first batch
+        self.fp_per_class = None  # Will be initialized on first batch
+        self.fn_per_class = None  # Will be initialized on first batch
 
     def accumulate(self, learn):
         """Accumulate metric for one batch"""
@@ -77,15 +65,27 @@ class RecallMultiStrip(Metric):
             pred_flat = pred.flatten()
             targ_flat = targ.flatten()
 
-            # Calculate True Positives and False Negatives for each class
-            for c in range(learn.pred.shape[self.axis]):
+            # Get number of classes
+            num_classes = learn.pred.shape[self.axis]
+
+            # Initialize per-class counters on first batch
+            if self.tp_per_class is None:
+                self.tp_per_class = [0] * num_classes
+                self.fp_per_class = [0] * num_classes
+                self.fn_per_class = [0] * num_classes
+
+            # Calculate TP, FP, and FN for each class
+            for c in range(num_classes):
                 # True positives: predicted as c and actually c
                 tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
+                # False positives: predicted as c but actually not c
+                fp = ((pred_flat == c) & (targ_flat != c)).sum().item()
                 # False negatives: actually c but not predicted as c
                 fn = ((pred_flat != c) & (targ_flat == c)).sum().item()
 
-                self.tp += tp
-                self.fn += fn
+                self.tp_per_class[c] += tp
+                self.fp_per_class[c] += fp
+                self.fn_per_class[c] += fn
 
         finally:
             # Always restore the original yb
@@ -93,11 +93,120 @@ class RecallMultiStrip(Metric):
 
     @property
     def value(self):
-        """Calculate recall: TP / (TP + FN)"""
-        # Avoid division by zero
-        if self.tp + self.fn == 0:
+        """
+        Calculate macro-averaged Dice coefficient: Average of per-class Dice values.
+        
+        Formula: Dice_c = 2*TP_c / (2*TP_c + FP_c + FN_c)
+        Macro-Dice = mean(Dice_c) for all classes c
+        
+        This gives equal weight to each class, regardless of pixel count.
+        """
+        if self.tp_per_class is None:
             return 0.0
-        return self.tp / (self.tp + self.fn)
+
+        # Calculate Dice per class
+        per_class_dice = []
+        for tp, fp, fn in zip(self.tp_per_class, self.fp_per_class, self.fn_per_class):
+            # Avoid division by zero for classes with no predictions or ground truth
+            if 2 * tp + fp + fn == 0:
+                per_class_dice.append(0.0)
+            else:
+                per_class_dice.append(2 * tp / (2 * tp + fp + fn))
+
+        # Return macro-averaged Dice (mean across all classes)
+        return sum(per_class_dice) / len(per_class_dice)
+
+
+
+class RecallMultiStrip(Metric):
+    """
+    Recall metric for multi-class segmentation that only looks at the first element if y is a tuple.
+    
+    FIXED: Uses macro-averaging to give equal weight to each class, regardless of pixel count.
+    This prevents the clear class (with many more pixels) from dominating the metric.
+    
+    Formula: Recall = TP / (TP + FN)
+    Macro-averaging: Calculate recall per class, then average across all classes.
+    """
+
+    def __init__(self, axis=1):
+        self.axis = axis
+        self.reset()
+
+    def reset(self):
+        """Reset metric state"""
+        # Track TP and FN per class for macro-averaging
+        self.tp_per_class = None  # Will be initialized on first batch
+        self.fn_per_class = None  # Will be initialized on first batch
+
+    def accumulate(self, learn):
+        """Accumulate metric for one batch"""
+        # Temporarily modify learn.yb (the underlying batch) instead of learn.y
+        yb_backup = learn.yb
+
+        # Extract targets if it's a tuple
+        if isinstance(learn.yb, (tuple, list)) and len(learn.yb) > 0:
+            if isinstance(learn.yb[0], (tuple, list)):
+                # If yb contains tuples, extract the first element of each tuple
+                learn.yb = (learn.yb[0][0],)  # Just the targets, keep it as a tuple
+            else:
+                learn.yb = (learn.yb[0],)  # Wrap in tuple to maintain structure
+
+        try:
+            # Get predictions and targets
+            pred = learn.pred.argmax(dim=self.axis)
+            targ = learn.y
+
+            # Flatten for per-pixel comparison
+            pred_flat = pred.flatten()
+            targ_flat = targ.flatten()
+
+            # Get number of classes
+            num_classes = learn.pred.shape[self.axis]
+
+            # Initialize per-class counters on first batch
+            if self.tp_per_class is None:
+                self.tp_per_class = [0] * num_classes
+                self.fn_per_class = [0] * num_classes
+
+            # Calculate True Positives and False Negatives for each class
+            for c in range(num_classes):
+                # True positives: predicted as c and actually c
+                tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
+                # False negatives: actually c but not predicted as c
+                fn = ((pred_flat != c) & (targ_flat == c)).sum().item()
+
+                self.tp_per_class[c] += tp
+                self.fn_per_class[c] += fn
+
+        finally:
+            # Always restore the original yb
+            learn.yb = yb_backup
+
+    @property
+    def value(self):
+        """
+        Calculate macro-averaged recall: Average of per-class recall values.
+        
+        Formula: Recall_c = TP_c / (TP_c + FN_c)
+        Macro-Recall = mean(Recall_c) for all classes c
+        
+        This gives equal weight to each class, regardless of pixel count.
+        """
+        if self.tp_per_class is None:
+            return 0.0
+
+        # Calculate recall per class
+        per_class_recall = []
+        for tp, fn in zip(self.tp_per_class, self.fn_per_class):
+            # Avoid division by zero for classes with no ground truth pixels
+            if tp + fn == 0:
+                per_class_recall.append(0.0)
+            else:
+                per_class_recall.append(tp / (tp + fn))
+
+        # Return macro-averaged recall (mean across all classes)
+        return sum(per_class_recall) / len(per_class_recall)
 
 
 class PrecisionMultiStrip(Metric):
@@ -107,8 +216,13 @@ class PrecisionMultiStrip(Metric):
     Precision measures how many of the predicted positive pixels are actually positive.
     Formula: Precision = TP / (TP + FP)
 
+    FIXED: Uses macro-averaging to give equal weight to each class, regardless of pixel count.
+    This prevents the clear class (with many more pixels) from dominating the metric.
+    
     This metric is important as a guardrail against false positives - a model with
     high recall but low precision will predict many false positives, which is undesirable.
+    
+    Macro-averaging: Calculate precision per class, then average across all classes.
     """
 
     def __init__(self, axis=1):
@@ -117,8 +231,9 @@ class PrecisionMultiStrip(Metric):
 
     def reset(self):
         """Reset metric state"""
-        self.tp = 0  # True positives
-        self.fp = 0  # False positives
+        # Track TP and FP per class for macro-averaging
+        self.tp_per_class = None  # Will be initialized on first batch
+        self.fp_per_class = None  # Will be initialized on first batch
 
     def accumulate(self, learn):
         """Accumulate metric for one batch"""
@@ -142,15 +257,23 @@ class PrecisionMultiStrip(Metric):
             pred_flat = pred.flatten()
             targ_flat = targ.flatten()
 
+            # Get number of classes
+            num_classes = learn.pred.shape[self.axis]
+
+            # Initialize per-class counters on first batch
+            if self.tp_per_class is None:
+                self.tp_per_class = [0] * num_classes
+                self.fp_per_class = [0] * num_classes
+
             # Calculate True Positives and False Positives for each class
-            for c in range(learn.pred.shape[self.axis]):
+            for c in range(num_classes):
                 # True positives: predicted as c and actually c
                 tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
                 # False positives: predicted as c but actually not c
                 fp = ((pred_flat == c) & (targ_flat != c)).sum().item()
 
-                self.tp += tp
-                self.fp += fp
+                self.tp_per_class[c] += tp
+                self.fp_per_class[c] += fp
 
         finally:
             # Always restore the original yb
@@ -158,11 +281,28 @@ class PrecisionMultiStrip(Metric):
 
     @property
     def value(self):
-        """Calculate precision: TP / (TP + FP)"""
-        # Avoid division by zero
-        if self.tp + self.fp == 0:
+        """
+        Calculate macro-averaged precision: Average of per-class precision values.
+        
+        Formula: Precision_c = TP_c / (TP_c + FP_c)
+        Macro-Precision = mean(Precision_c) for all classes c
+        
+        This gives equal weight to each class, regardless of pixel count.
+        """
+        if self.tp_per_class is None:
             return 0.0
-        return self.tp / (self.tp + self.fp)
+
+        # Calculate precision per class
+        per_class_precision = []
+        for tp, fp in zip(self.tp_per_class, self.fp_per_class):
+            # Avoid division by zero for classes with no predictions
+            if tp + fp == 0:
+                per_class_precision.append(0.0)
+            else:
+                per_class_precision.append(tp / (tp + fp))
+
+        # Return macro-averaged precision (mean across all classes)
+        return sum(per_class_precision) / len(per_class_precision)
 
 
 class IoUMultiStrip(Metric):
@@ -173,9 +313,14 @@ class IoUMultiStrip(Metric):
     IoU measures the overlap between predicted and actual masks.
     Formula: IoU = TP / (TP + FP + FN)
 
+    FIXED: Uses macro-averaging to give equal weight to each class, regardless of pixel count.
+    This prevents the clear class (with many more pixels) from dominating the metric.
+    
     This metric provides a balanced view of model performance by considering both
     false positives and false negatives. It's useful for monitoring but not
     directly used in the composite score.
+    
+    Macro-averaging: Calculate IoU per class, then average across all classes.
     """
 
     def __init__(self, axis=1):
@@ -184,9 +329,10 @@ class IoUMultiStrip(Metric):
 
     def reset(self):
         """Reset metric state"""
-        self.tp = 0  # True positives
-        self.fp = 0  # False positives
-        self.fn = 0  # False negatives
+        # Track TP, FP, and FN per class for macro-averaging
+        self.tp_per_class = None  # Will be initialized on first batch
+        self.fp_per_class = None  # Will be initialized on first batch
+        self.fn_per_class = None  # Will be initialized on first batch
 
     def accumulate(self, learn):
         """Accumulate metric for one batch"""
@@ -210,8 +356,17 @@ class IoUMultiStrip(Metric):
             pred_flat = pred.flatten()
             targ_flat = targ.flatten()
 
+            # Get number of classes
+            num_classes = learn.pred.shape[self.axis]
+
+            # Initialize per-class counters on first batch
+            if self.tp_per_class is None:
+                self.tp_per_class = [0] * num_classes
+                self.fp_per_class = [0] * num_classes
+                self.fn_per_class = [0] * num_classes
+
             # Calculate TP, FP, and FN for each class
-            for c in range(learn.pred.shape[self.axis]):
+            for c in range(num_classes):
                 # True positives: predicted as c and actually c
                 tp = ((pred_flat == c) & (targ_flat == c)).sum().item()
                 # False positives: predicted as c but actually not c
@@ -219,9 +374,9 @@ class IoUMultiStrip(Metric):
                 # False negatives: actually c but not predicted as c
                 fn = ((pred_flat != c) & (targ_flat == c)).sum().item()
 
-                self.tp += tp
-                self.fp += fp
-                self.fn += fn
+                self.tp_per_class[c] += tp
+                self.fp_per_class[c] += fp
+                self.fn_per_class[c] += fn
 
         finally:
             # Always restore the original yb
@@ -229,11 +384,28 @@ class IoUMultiStrip(Metric):
 
     @property
     def value(self):
-        """Calculate IoU: TP / (TP + FP + FN)"""
-        # Avoid division by zero
-        if self.tp + self.fp + self.fn == 0:
+        """
+        Calculate macro-averaged IoU: Average of per-class IoU values.
+        
+        Formula: IoU_c = TP_c / (TP_c + FP_c + FN_c)
+        Macro-IoU = mean(IoU_c) for all classes c
+        
+        This gives equal weight to each class, regardless of pixel count.
+        """
+        if self.tp_per_class is None:
             return 0.0
-        return self.tp / (self.tp + self.fp + self.fn)
+
+        # Calculate IoU per class
+        per_class_iou = []
+        for tp, fp, fn in zip(self.tp_per_class, self.fp_per_class, self.fn_per_class):
+            # Avoid division by zero for classes with no predictions or ground truth
+            if tp + fp + fn == 0:
+                per_class_iou.append(0.0)
+            else:
+                per_class_iou.append(tp / (tp + fp + fn))
+
+        # Return macro-averaged IoU (mean across all classes)
+        return sum(per_class_iou) / len(per_class_iou)
 
 
 class CrossEntropyLossFlatImageTypeWeighted:

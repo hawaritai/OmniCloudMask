@@ -306,13 +306,59 @@ def verify_safetensors_integrity(safetensor_path: Path, model: torch.nn.Module) 
         return False
 
 
+# --- HELPER FUNCTIONS FOR METRICS AND VISUALIZATIONS ---
+
+def simplify_model_name(full_name: str) -> str:
+    """
+    Simplify model name to format: {version}_{model_type}_{base|best}
+    
+    Extracts:
+    - Version number (e.g., 6.43, 7.97)
+    - Model type (e.g., edgenext_small, regnety_004, convnextv2_nano)
+    - Base/Best indicator (from filename)
+    
+    Examples:
+        PM_model_OCM_6.43_RG_NIR_edgenext_small.usi_in1k_best.safetensors -> 6.43_edgenext_small_best
+        PM_model_OCM_7.97_R_G_NIR_3_smp_regnety_004.pycls_in1k.safetensors -> 7.97_regnety_004_base
+    """
+    import re
+    
+    # Remove file extension
+    name_without_ext = full_name.replace('.safetensors', '').replace('.pth', '')
+    
+    # Extract version number (looks for pattern like 6.43, 7.97, etc.)
+    version_match = re.search(r'(\d+\.\d+)', name_without_ext)
+    version = version_match.group(1) if version_match else 'unknown'
+    
+    # Extract model type (regnety, edgenext, convnext, etc.)
+    model_type = None
+    for mt in ['regnety_004', 'edgenext_small', 'convnextv2_nano', 'regnety', 'edgenext', 'convnext']:
+        if mt in name_without_ext.lower():
+            # Use the full matched pattern
+            full_match = re.search(re.escape(mt), name_without_ext, re.IGNORECASE)
+            if full_match:
+                model_type = full_match.group(0)
+                break
+    
+    if model_type is None:
+        model_type = 'unknown'
+    
+    # Determine if it's base or best
+    if 'best' in name_without_ext.lower():
+        variant = 'best'
+    else:
+        variant = 'base'
+    
+    return f"{version}_{model_type}_{variant}"
+
+
 # --- MODEL CONFIGURATIONS ---
 # Define models to compare here
 model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
 # models_dir = project_root / "ckpts"
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2\models")
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2.4\models")
 bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
 
 if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
@@ -761,6 +807,31 @@ class ModelComparator:
                 
             metrics['Mean_AP'] = float(np.mean(avg_aps))
             
+            # Macro-averaged metrics (equal weight for all classes)
+            metrics['Macro_Precision'] = float(precision_score(y_true_valid, y_pred_valid, average='macro', zero_division=0))
+            metrics['Macro_Recall'] = float(recall_score(y_true_valid, y_pred_valid, average='macro', zero_division=0))
+            metrics['Macro_F1'] = float(f1_score(y_true_valid, y_pred_valid, average='macro', zero_division=0))
+            metrics['Macro_IoU'] = float(jaccard_score(y_true_valid, y_pred_valid, average='macro', zero_division=0))
+            
+            # Class support (pixel counts for each class)
+            metrics['class_support'] = {}
+            for i, name in enumerate(CLASS_NAMES):
+                metrics['class_support'][name] = int((y_true_valid == i).sum())
+            
+            # Minority class average metrics (Thick Cloud, Thin Cloud, Cloud Shadow)
+            minority_classes = ['Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+            minority_indices = [CLASS_NAMES.index(cls) for cls in minority_classes if cls in CLASS_NAMES]
+            if minority_indices:
+                metrics['Minority_Mean_IoU'] = float(np.mean([iou[i] for i in minority_indices]))
+                metrics['Minority_Mean_F1'] = float(np.mean([f1[i] for i in minority_indices]))
+                metrics['Minority_Mean_Precision'] = float(np.mean([precision[i] for i in minority_indices]))
+                metrics['Minority_Mean_Recall'] = float(np.mean([recall[i] for i in minority_indices]))
+            else:
+                metrics['Minority_Mean_IoU'] = 0.0
+                metrics['Minority_Mean_F1'] = 0.0
+                metrics['Minority_Mean_Precision'] = 0.0
+                metrics['Minority_Mean_Recall'] = 0.0
+            
             # Confusion Matrix (normalized for visualization)
             from sklearn.metrics import confusion_matrix
             cm = confusion_matrix(y_true_valid, y_pred_valid, labels=range(len(CLASS_NAMES)), normalize='true')
@@ -784,25 +855,339 @@ class ModelComparator:
                 'Mean_AP': 0.0,
                 'Weighted_Precision': 0.0,
                 'Weighted_Recall': 0.0,
+                'Macro_Precision': 0.0,
+                'Macro_Recall': 0.0,
+                'Macro_F1': 0.0,
+                'Macro_IoU': 0.0,
+                'Minority_Mean_IoU': 0.0,
+                'Minority_Mean_F1': 0.0,
+                'Minority_Mean_Precision': 0.0,
+                'Minority_Mean_Recall': 0.0,
+                'class_support': {},
                 'per_class': {},
                 'pr_data': {},
                 'confusion_matrix': [],
                 'confusion_matrix_raw': []
             }
 
-    def plot_comparisons(self, all_metrics):
+    def plot_per_class_precision_recall(self, all_metrics, simplified_names):
         """
-        Generate comparison plots with improved error handling.
+        Generate per-class precision and recall comparison plots.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            precision_rows = []
+            recall_rows = []
+            
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
+                for cls_name in CLASS_NAMES:
+                    per_class = m.get('per_class', {})
+                    if cls_name in per_class:
+                        precision_rows.append({
+                            'Model': short_name,
+                            'Class': cls_name,
+                            'Precision': per_class[cls_name].get('Precision', 0.0)
+                        })
+                        recall_rows.append({
+                            'Model': short_name,
+                            'Class': cls_name,
+                            'Recall': per_class[cls_name].get('Recall', 0.0)
+                        })
+            
+            if precision_rows and recall_rows:
+                df_prec = pd.DataFrame(precision_rows)
+                df_rec = pd.DataFrame(recall_rows)
+                
+                fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+                
+                sns.barplot(data=df_prec, x='Class', y='Precision', hue='Model', ax=axes[0])
+                axes[0].set_title('Per-Class Precision Comparison')
+                axes[0].set_ylim(0, 1.0)
+                axes[0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                
+                sns.barplot(data=df_rec, x='Class', y='Recall', hue='Model', ax=axes[1])
+                axes[1].set_title('Per-Class Recall Comparison')
+                axes[1].set_ylim(0, 1.0)
+                axes[1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                
+                plt.tight_layout()
+                plt.savefig(self.plots_dir / 'per_class_precision_recall.png')
+                plt.close()
+                logger.info("   Saved per-class precision/recall plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating per-class precision/recall plot: {e}")
+    
+    def plot_macro_vs_weighted(self, all_metrics, simplified_names):
+        """
+        Generate macro vs weighted metrics comparison plot.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            rows = []
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
+                rows.append({
+                    'Model': short_name,
+                    'Weighted Precision': m.get('Weighted_Precision', 0.0),
+                    'Macro Precision': m.get('Macro_Precision', 0.0),
+                    'Weighted Recall': m.get('Weighted_Recall', 0.0),
+                    'Macro Recall': m.get('Macro_Recall', 0.0),
+                    'Weighted F1': m.get('Weighted_F1', m.get('Mean_F1', 0.0)),
+                    'Macro F1': m.get('Macro_F1', m.get('Mean_F1', 0.0)),
+                    'Weighted IoU': m.get('Mean_IoU', 0.0),
+                    'Macro IoU': m.get('Macro_IoU', 0.0)
+                })
+            
+            if rows:
+                df = pd.DataFrame(rows)
+                df_melted = df.melt('Model', var_name='Metric', value_name='Score')
+                
+                plt.figure(figsize=(14, 8))
+                sns.barplot(data=df_melted, x='Metric', y='Score', hue='Model')
+                plt.title('Macro vs Weighted Metrics Comparison')
+                plt.ylim(0, 1.0)
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(self.plots_dir / 'macro_vs_weighted_metrics.png')
+                plt.close()
+                logger.info("   Saved macro vs weighted metrics plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating macro vs weighted plot: {e}")
+    
+    def plot_minority_class_radar(self, all_metrics, simplified_names):
+        """
+        Generate radar chart for minority class performance.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            minority_classes = ['Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+            
+            fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+            
+            # Compute average metrics across minority classes for each model
+            categories = ['IoU', 'F1', 'Precision', 'Recall']
+            N = len(categories)
+            angles = [n / float(N) * 2 * np.pi for n in range(N)]
+            angles += angles[:1]
+            
+            ax.set_theta_offset(np.pi / 2)
+            ax.set_theta_direction(-1)
+            ax.set_thetagrids(angles[:-1], categories)
+            
+            colors = plt.cm.tab10(np.linspace(0, 1, len(all_metrics)))
+            
+            for idx, (full_name, m) in enumerate(all_metrics.items()):
+                short_name = simplified_names.get(full_name, full_name)
+                per_class = m.get('per_class', {})
+                
+                values = []
+                for cls in minority_classes:
+                    if cls in per_class:
+                        values.append(per_class[cls].get('IoU', 0.0))
+                        values.append(per_class[cls].get('F1', 0.0))
+                        values.append(per_class[cls].get('Precision', 0.0))
+                        values.append(per_class[cls].get('Recall', 0.0))
+                
+                if values:
+                    # Average across minority classes
+                    avg_values = []
+                    for i in range(N):
+                        avg_values.append(np.mean([values[i + j * N] for j in range(len(minority_classes))]))
+                    avg_values += avg_values[:1]
+                    
+                    ax.plot(angles, avg_values, 'o-', linewidth=2, label=short_name, color=colors[idx])
+                    ax.fill(angles, avg_values, alpha=0.15, color=colors[idx])
+            
+            ax.set_ylim(0, 1.0)
+            ax.set_title('Minority Class Performance (Average of Thick Cloud, Thin Cloud, Cloud Shadow)',
+                        size=14, pad=20)
+            ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+            plt.tight_layout()
+            plt.savefig(self.plots_dir / 'minority_class_radar.png', bbox_inches='tight')
+            plt.close()
+            logger.info("   Saved minority class radar plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating minority class radar plot: {e}")
+    
+    def plot_class_performance_ranking(self, all_metrics, simplified_names):
+        """
+        Generate heatmap showing ranking of models for each class.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            # Create ranking matrix
+            ranking_data = {}
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
+                per_class = m.get('per_class', {})
+                ranking_data[short_name] = {}
+                for cls_name in CLASS_NAMES:
+                    if cls_name in per_class:
+                        ranking_data[short_name][cls_name] = per_class[cls_name].get('F1', 0.0)
+            
+            if ranking_data:
+                df = pd.DataFrame(ranking_data).T
+                
+                # Create ranking (1 = best)
+                ranking_df = df.rank(ascending=False)
+                
+                fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+                
+                # Plot scores
+                sns.heatmap(df, annot=True, fmt='.3f', cmap='RdYlGn',
+                           vmin=0, vmax=1, ax=axes[0], cbar_kws={'label': 'F1 Score'})
+                axes[0].set_title('Per-Class F1 Scores')
+                axes[0].set_xlabel('Class')
+                axes[0].set_ylabel('Model')
+                
+                # Plot rankings
+                sns.heatmap(ranking_df, annot=True, fmt='.0f', cmap='RdYlGn_r',
+                           vmin=1, vmax=len(all_metrics), ax=axes[1], cbar_kws={'label': 'Rank (1=Best)'})
+                axes[1].set_title('Per-Class F1 Rankings')
+                axes[1].set_xlabel('Class')
+                axes[1].set_ylabel('Model')
+                
+                plt.tight_layout()
+                plt.savefig(self.plots_dir / 'class_performance_ranking.png')
+                plt.close()
+                logger.info("   Saved class performance ranking plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating class performance ranking plot: {e}")
+    
+    def plot_class_distribution(self, all_metrics):
+        """
+        Generate bar chart showing pixel distribution across classes.
         
         Args:
             all_metrics: Dictionary of metrics for each model
         """
         try:
-            # 1. Metrics Bar Chart
+            # Use class support from first model (should be same for all)
+            if not all_metrics:
+                return
+            
+            first_model = list(all_metrics.values())[0]
+            class_support = first_model.get('class_support', {})
+            
+            if class_support:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                classes = list(class_support.keys())
+                counts = list(class_support.values())
+                
+                bars = ax.bar(classes, counts, color=plt.cm.tab10(np.arange(len(classes))))
+                ax.set_ylabel('Number of Pixels')
+                ax.set_title('Class Distribution in Validation Set')
+                ax.set_yscale('log')  # Log scale for better visualization of imbalanced data
+                
+                # Add count labels on bars
+                for bar, count in zip(bars, counts):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{count:,}',
+                           ha='center', va='bottom')
+                
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(self.plots_dir / 'class_distribution.png')
+                plt.close()
+                logger.info("   Saved class distribution plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating class distribution plot: {e}")
+    
+    def plot_minority_confusion_matrices(self, all_metrics, simplified_names):
+        """
+        Generate zoomed-in confusion matrices focusing on minority classes.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            minority_classes = ['Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+            minority_indices = [CLASS_NAMES.index(cls) for cls in minority_classes if cls in CLASS_NAMES]
+            
+            if not minority_indices or not all_metrics:
+                return
+            
+            num_models = len(all_metrics)
+            n_cols = min(3, num_models)
+            n_rows = (num_models + n_cols - 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+            axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
+            
+            for idx, (full_name, m) in enumerate(all_metrics.items()):
+                ax = axes[idx]
+                short_name = simplified_names.get(full_name, full_name)
+                cm = np.array(m.get('confusion_matrix', []))
+                
+                if cm.size > 0:
+                    # Extract minority class portion of confusion matrix
+                    cm_minority = cm[np.ix_(minority_indices, minority_indices)]
+                    minority_labels = [CLASS_NAMES[i] for i in minority_indices]
+                    
+                    sns.heatmap(cm_minority, annot=True, fmt='.2f', cmap='Blues',
+                               xticklabels=minority_labels, yticklabels=minority_labels,
+                               ax=ax, vmin=0, vmax=1)
+                    ax.set_title(f'{short_name}\n(Minority Classes Only)')
+                    ax.set_ylabel('True Label')
+                    ax.set_xlabel('Predicted Label')
+            
+            # Hide unused subplots
+            for idx in range(num_models, len(axes)):
+                fig.delaxes(axes[idx])
+            
+            plt.tight_layout()
+            plt.savefig(self.plots_dir / 'minority_class_confusion_matrices.png')
+            plt.close()
+            logger.info("   Saved minority class confusion matrices plot")
+            
+        except Exception as e:
+            logger.error(f"Error generating minority class confusion matrices: {e}")
+    
+    def plot_comparisons(self, all_metrics, simplified_names):
+        """
+        Generate comparison plots with improved error handling.
+        
+        Args:
+            all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
+        """
+        try:
+            # Generate new visualizations
+            self.plot_per_class_precision_recall(all_metrics, simplified_names)
+            self.plot_macro_vs_weighted(all_metrics, simplified_names)
+            self.plot_minority_class_radar(all_metrics, simplified_names)
+            self.plot_class_performance_ranking(all_metrics, simplified_names)
+            self.plot_class_distribution(all_metrics)
+            self.plot_minority_confusion_matrices(all_metrics, simplified_names)
+            
+            # 1. Metrics Bar Chart (existing, updated with simplified names)
             df_rows = []
-            for model_name, m in all_metrics.items():
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
                 df_rows.append({
-                    'Model': model_name,
+                    'Model': short_name,
                     'Accuracy': m.get('Accuracy', 0.0),
                     'Mean IoU': m.get('Mean_IoU', 0.0),
                     'Mean F1': m.get('Mean_F1', 0.0),
@@ -822,14 +1207,15 @@ class ModelComparator:
             plt.close()
             logger.info("   Saved metrics comparison plot")
             
-            # 2. Per-Class F1 Score Comparison
+            # 2. Per-Class F1 Score Comparison (updated with simplified names)
             class_rows = []
-            for model_name, m in all_metrics.items():
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
                 for cls_name in CLASS_NAMES:
                     per_class = m.get('per_class', {})
                     if cls_name in per_class:
                         class_rows.append({
-                            'Model': model_name,
+                            'Model': short_name,
                             'Class': cls_name,
                             'F1 Score': per_class[cls_name].get('F1', 0.0),
                             'IoU': per_class[cls_name].get('IoU', 0.0)
@@ -868,13 +1254,14 @@ class ModelComparator:
                 fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
                 axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
                 
-                for idx, (model_name, m) in enumerate(all_metrics.items()):
+                for idx, (full_name, m) in enumerate(all_metrics.items()):
                     ax = axes[idx]
+                    short_name = simplified_names.get(full_name, full_name)
                     cm = np.array(m.get('confusion_matrix', []))
                     if cm.size > 0:
-                        sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', 
+                        sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
                                     xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax, vmin=0, vmax=1)
-                        ax.set_title(f'{model_name}')
+                        ax.set_title(f'{short_name}')
                         ax.set_ylabel('True Label')
                         ax.set_xlabel('Predicted Label')
                 
@@ -891,13 +1278,14 @@ class ModelComparator:
                 fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
                 axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
                 
-                for idx, (model_name, m) in enumerate(all_metrics.items()):
+                for idx, (full_name, m) in enumerate(all_metrics.items()):
                     ax = axes[idx]
+                    short_name = simplified_names.get(full_name, full_name)
                     cm_raw = np.array(m.get('confusion_matrix_raw', []))
                     if cm_raw.size > 0:
                         sns.heatmap(cm_raw, annot=True, fmt='d', cmap='Blues',
                                     xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
-                        ax.set_title(f'{model_name}')
+                        ax.set_title(f'{short_name}')
                         ax.set_ylabel('True Label')
                         ax.set_xlabel('Predicted Label')
                 
@@ -916,11 +1304,12 @@ class ModelComparator:
                 
                 for i, cls_name in enumerate(CLASS_NAMES):
                     ax = axes[i]
-                    for model_name, m in all_metrics.items():
+                    for full_name, m in all_metrics.items():
+                        short_name = simplified_names.get(full_name, full_name)
                         pr_data = m.get('pr_data', {})
                         if cls_name in pr_data:
-                            ax.plot(pr_data[cls_name]['recall'], pr_data[cls_name]['precision'], 
-                                     label=f"{model_name} (AP={pr_data[cls_name]['ap']:.2f})")
+                            ax.plot(pr_data[cls_name]['recall'], pr_data[cls_name]['precision'],
+                                     label=f"{short_name} (AP={pr_data[cls_name]['ap']:.2f})")
                     
                     ax.set_title(f'PR Curve: {cls_name}')
                     ax.set_xlabel('Recall')
@@ -993,11 +1382,19 @@ class ModelComparator:
                 )
                 
                 if success:
-                    logger.info(f" Successfully evaluated {config['name']}")
+                    short_name = simplify_model_name(config['name'])
+                    logger.info(f" Successfully evaluated {short_name}")
                     logger.info(f"  Accuracy: {metrics['Accuracy']:.4f}")
                     logger.info(f"  Mean IoU: {metrics['Mean_IoU']:.4f}")
                     logger.info(f"  Mean F1: {metrics['Mean_F1']:.4f}")
                     logger.info(f"  Mean AP: {metrics['Mean_AP']:.4f}")
+                    logger.info(f"  Weighted Precision: {metrics['Weighted_Precision']:.4f}")
+                    logger.info(f"  Weighted Recall: {metrics['Weighted_Recall']:.4f}")
+                    logger.info(f"  Macro Precision: {metrics['Macro_Precision']:.4f}")
+                    logger.info(f"  Macro Recall: {metrics['Macro_Recall']:.4f}")
+                    logger.info(f"  Macro IoU: {metrics['Macro_IoU']:.4f}")
+                    logger.info(f"  Minority Mean IoU: {metrics['Minority_Mean_IoU']:.4f}")
+                    logger.info(f"  Minority Mean F1: {metrics['Minority_Mean_F1']:.4f}")
                     logger.info(f"  Evaluation time: {metrics['eval_time']:.2f}s")
                     success_count += 1
                 else:
@@ -1021,10 +1418,15 @@ class ModelComparator:
         
         # 3. Create Summary Table
         if all_metrics:
-            self.create_summary_table(all_metrics)
+            # Create simplified names mapping
+            simplified_names = {}
+            for full_name in all_metrics.keys():
+                simplified_names[full_name] = simplify_model_name(full_name)
+            
+            self.create_summary_table(all_metrics, simplified_names)
             
             # 4. Generate Comparison Plots
-            self.plot_comparisons(all_metrics)
+            self.plot_comparisons(all_metrics, simplified_names)
         else:
             logger.warning("No models were successfully evaluated. Skipping summary and plots.")
         
@@ -1038,32 +1440,57 @@ class ModelComparator:
         logger.info(f"Results saved to: {self.output_dir}")
         logger.info(f"{'='*60}\n")
 
-    def create_summary_table(self, all_metrics):
+    def create_summary_table(self, all_metrics, simplified_names):
         """
         Create and save a summary table of all model metrics.
         
         Args:
             all_metrics: Dictionary of metrics for each model
+            simplified_names: Dictionary mapping full names to simplified names
         """
         try:
             rows = []
-            for name, m in all_metrics.items():
+            for full_name, m in all_metrics.items():
+                short_name = simplified_names.get(full_name, full_name)
                 row = {
-                    'Model': name,
+                    'Model': short_name,
                     'Accuracy': m.get('Accuracy', 0.0),
                     'Mean_IoU': m.get('Mean_IoU', 0.0),
                     'Mean_F1': m.get('Mean_F1', 0.0),
                     'Mean_AP': m.get('Mean_AP', 0.0),
                     'Time(s)': m.get('eval_time', 0.0)
                 }
-                # Add per-class IoU
+                # Weighted metrics
+                row['Weighted_Precision'] = m.get('Weighted_Precision', 0.0)
+                row['Weighted_Recall'] = m.get('Weighted_Recall', 0.0)
+                row['Weighted_F1'] = m.get('Weighted_F1', m.get('Mean_F1', 0.0))
+                
+                # Macro metrics
+                row['Macro_Precision'] = m.get('Macro_Precision', 0.0)
+                row['Macro_Recall'] = m.get('Macro_Recall', 0.0)
+                row['Macro_F1'] = m.get('Macro_F1', 0.0)
+                row['Macro_IoU'] = m.get('Macro_IoU', 0.0)
+                
+                # Minority class metrics
+                row['Minority_Mean_IoU'] = m.get('Minority_Mean_IoU', 0.0)
+                row['Minority_Mean_F1'] = m.get('Minority_Mean_F1', 0.0)
+                row['Minority_Mean_Precision'] = m.get('Minority_Mean_Precision', 0.0)
+                row['Minority_Mean_Recall'] = m.get('Minority_Mean_Recall', 0.0)
+                
+                # Add per-class metrics
                 for cls_name in CLASS_NAMES:
                     if cls_name in m.get('per_class', {}):
                         row[f'{cls_name}_IoU'] = m['per_class'][cls_name]['IoU']
+                        row[f'{cls_name}_F1'] = m['per_class'][cls_name]['F1']
+                        row[f'{cls_name}_Precision'] = m['per_class'][cls_name]['Precision']
+                        row[f'{cls_name}_Recall'] = m['per_class'][cls_name]['Recall']
                     else:
                         row[f'{cls_name}_IoU'] = 0.0
+                        row[f'{cls_name}_F1'] = 0.0
+                        row[f'{cls_name}_Precision'] = 0.0
+                        row[f'{cls_name}_Recall'] = 0.0
                 rows.append(row)
-                
+            
             df = pd.DataFrame(rows)
             print("\n=== Summary Metrics ===")
             print(df.to_string(index=False, float_format=lambda x: "{:.4f}".format(x)))
@@ -1107,7 +1534,7 @@ if __name__ == "__main__":
         logger.info("="*60)
         
         # Create output directory
-        output_dir = project_root / f"model_comparison_results_{CUSTOM_MODEL_VERSION}"
+        output_dir = project_root / "model_comparison_results" / f"model_comparison_results_{CUSTOM_MODEL_VERSION}"
         logger.info(f"Output directory: {output_dir}")
         
         # Initialize comparator
