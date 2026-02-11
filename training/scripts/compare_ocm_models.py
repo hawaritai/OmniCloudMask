@@ -17,11 +17,12 @@ import pandas as pd
 import seaborn as sns
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, jaccard_score, precision_recall_curve, average_precision_score
 from safetensors.torch import load_file
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 import gc
 import time
 
 from custom_model_utils import build_custom_model, load_custom_weights
+from omnicloudmask.cloud_mask import predict_from_array
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -80,7 +81,7 @@ try:
     except ImportError:
         COMPARISON_QUICK_TEST = False
         COMPARISON_QUICK_TEST_SAMPLES = 50
-        COMPARISON_BATCH_SIZE = 8
+        COMPARISON_BATCH_SIZE = 12
         COMPARISON_USE_BF16 = False
         MODEL_CONFIG = {
             "v4": {"model_library": "smp"},
@@ -327,7 +328,7 @@ def simplify_model_name(full_name: str) -> str:
     name_without_ext = full_name.replace('.safetensors', '').replace('.pth', '')
     
     # Extract version number (looks for pattern like 6.43, 7.97, etc.)
-    version_match = re.search(r'(\d+\.\d+)', name_without_ext)
+    version_match = re.search(r'(\d+\.\d+(?:\.\d+)*)', name_without_ext)
     version = version_match.group(1) if version_match else 'unknown'
     
     # Extract model type (regnety, edgenext, convnext, etc.)
@@ -358,7 +359,8 @@ model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
 # models_dir = project_root / "ckpts"
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2.4\models")
+# fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2.6\models")
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\tmp\from_2.80\2_stage_tr\1")
 bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
 
 if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
@@ -702,6 +704,102 @@ class ModelComparator:
         logger.info(f"  Evaluation complete. Processed: {processed_count}, Failed: {failed_count}")
         
         return np.concatenate(all_preds), np.concatenate(all_targets), np.concatenate(all_probs)
+
+    def evaluate_model_with_predict_from_array(
+        self, 
+        model: torch.nn.Module,
+        image_files: List[Path],
+        label_files: List[Path],
+        patch_size: int = 1000,
+        patch_overlap: int = 300,
+        batch_size: int = 1,
+        inference_dtype: Union[torch.dtype, str] = torch.float32
+    ):
+        """
+        Evaluate model on validation data using predict_from_array function.
+        
+        This method uses the production inference methodology from omnicloudmask.cloud_mask,
+        which handles patch-based inference internally. Images are assumed to be already
+        at the correct size (509x509) and normalization is handled by predict_from_array.
+        
+        Args:
+            model: The loaded model to evaluate
+            image_files: List of image file paths
+            label_files: List of label file paths
+            patch_size: Size of patches for inference (default: 509)
+            patch_overlap: Overlap between patches (default: 0 since images fit in one patch)
+            batch_size: Batch size for inference (default: 1)
+            inference_dtype: Data type for inference (default: torch.float32)
+            
+        Returns:
+            Tuple of (predictions, targets, probabilities) or (None, None, None) on failure
+            - predictions: numpy array of shape (N, H, W) with predicted class labels
+            - targets: numpy array of shape (N, H, W) with ground truth labels
+            - probabilities: numpy array of shape (N, C, H, W) with class probabilities
+        """
+        all_preds = []
+        all_targets = []
+        all_probs = []
+        processed_count = 0
+        failed_count = 0
+        
+        logger.info(f"Processing {len(image_files)} images using predict_from_array (patch_size={patch_size}, batch_size={batch_size})")
+        
+        for img_path, lbl_path in zip(image_files, label_files):
+            try:
+                # Load image (no preprocessing needed - images are already 509x509)
+                with rio.open(img_path) as src:
+                    # Read bands in the order specified by BAND_ORDER
+                    input_array = src.read(BAND_ORDER).astype(np.float32)
+                
+                # Load label (no preprocessing needed - labels are already 509x509)
+                with rio.open(lbl_path) as src_lbl:
+                    label = src_lbl.read(1)
+                
+                # Call predict_from_array with export_confidence=True to get both predictions and probabilities
+                # The function handles normalization internally
+                prediction_output = predict_from_array(
+                    input_array=input_array,
+                    inference_device=DEVICE,
+                    inference_dtype=inference_dtype,
+                    export_confidence=True,  # Get confidence/probabilities
+                    softmax_output=True,     # Apply softmax to confidence
+                    custom_models=[model],   # Pass the loaded model
+                    pred_classes=len(CLASS_NAMES),
+                )
+                
+                # prediction_output shape: (4, H, W) - confidence/probabilities for each class
+                # Extract predictions using argmax
+                pred = np.argmax(prediction_output, axis=0)  # Shape: (H, W)
+                
+                # probabilities is the confidence output itself
+                probs = prediction_output  # Shape: (4, H, W)
+                
+                all_preds.append(pred)
+                all_targets.append(label)
+                all_probs.append(probs)
+                
+                processed_count += 1
+                
+                if processed_count % 10 == 0:
+                    logger.info(f"  Processed {processed_count}/{len(image_files)} images")
+            
+            except Exception as e:
+                logger.error(f"  Error processing {img_path.name}: {e}")
+                failed_count += 1
+                continue
+        
+        if not all_preds:
+            logger.error(f"  CRITICAL: All images failed. Processed: {processed_count}, Failed: {failed_count}")
+            return None, None, None
+        
+        logger.info(f"  Evaluation complete. Processed: {processed_count}, Failed: {failed_count}")
+        
+        # Convert lists to numpy arrays
+        # predictions: (N, H, W)
+        # targets: (N, H, W)
+        # probabilities: (N, C, H, W)
+        return np.stack(all_preds), np.stack(all_targets), np.stack(all_probs)
 
     def compute_metrics(self, y_true, y_pred, y_probs):
         """
@@ -1357,7 +1455,11 @@ class ModelComparator:
                 continue
             
             try:
-                y_pred, y_true, y_probs = self.evaluate_model(model, image_files, label_files)
+                # # Method 1: Direct model inference (original)
+                # y_pred, y_true, y_probs = self.evaluate_model(model, image_files, label_files)
+                # Method 2: Using predict_from_array (new)
+                y_pred, y_true, y_probs = comparator.evaluate_model_with_predict_from_array(model, image_files, label_files)
+
                 
                 if y_pred is None or y_true is None or y_probs is None:
                     failure_count += 1

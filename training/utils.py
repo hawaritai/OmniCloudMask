@@ -471,6 +471,154 @@ class CrossEntropyLossFlatImageTypeWeighted:
         return weighted_losses.mean()
 
 
+class FocalLossFlatImageTypeWeighted:
+    """
+    Focal Loss for segmentation that addresses class imbalance by focusing on hard examples.
+    
+    Focal Loss reduces the relative loss for well-classified examples,
+    putting more focus on hard, misclassified examples.
+    
+    Formula: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    Where:
+    - p_t: predicted probability for true class
+    - alpha_t: class weight for true class
+    - gamma: focusing parameter (typically 2.0)
+    
+    Benefits over standard cross-entropy:
+    - Automatically focuses on hard-to-classify pixels (shadows, thin clouds)
+    - Reduces need for extreme class weights that cause false positives
+    - Better handles class imbalance in fine-tuning scenarios
+    
+    Args:
+        axis: Channel axis for predictions (default: 1)
+        ignore_index: Index to ignore in loss (default: 99)
+        class_weights: Per-class weights [clear, thick, thin, shadow] (default: None)
+        gamma: Focusing parameter, higher = more focus on hard examples (default: 2.0)
+    """
+    
+    def __init__(
+        self,
+        axis: int = 1,
+        ignore_index: int = 99,
+        class_weights: Optional[Tensor] = None,
+        gamma: float = 2.0,
+    ):
+        self.axis = axis
+        self.ignore_index = ignore_index
+        self.gamma = gamma
+        # Ensure class_weights is on the correct device when needed
+        self.class_weights = class_weights
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.float()
+
+    def __call__(self, preds: Tensor, targets: Tensor, image_weights: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            preds: [bs, classes, h, w] - model predictions (logits)
+            targets: [bs, h, w] - ground truth labels
+            image_weights: [bs] - optional weights per image (may not be provided by fastai)
+        """
+        
+        # Handle case where image_weights is not provided by fastai
+        if image_weights is None:
+            image_weights = torch.ones(targets.shape[0], device=targets.device)
+        
+        weights = image_weights.to(targets.device, dtype=torch.float)
+        
+        # Move class_weights to the correct device if they exist
+        class_weights = self.class_weights
+        if class_weights is not None:
+            class_weights = class_weights.to(preds.device)
+        
+        _, classes, _, _ = preds.shape
+        preds_flat = preds.permute(0, 2, 3, 1).contiguous().view(-1, classes)
+        targets_flat = targets.reshape(-1)
+        
+        # Calculate cross-entropy loss first
+        ce_loss = F.cross_entropy(
+            preds_flat,
+            targets_flat,
+            ignore_index=self.ignore_index,
+            reduction="none",
+            weight=class_weights,
+        )
+        
+        # Calculate p_t: predicted probability for the true class
+        # p_t = exp(-ce_loss)
+        p_t = torch.exp(-ce_loss)
+        
+        # Apply focal weighting: (1 - p_t)^gamma
+        # This down-weights easy examples (high p_t) and focuses on hard examples (low p_t)
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Calculate focal loss
+        pixel_losses = focal_weight * ce_loss
+        
+        # Some images have large areas of the ignore index, so we take the mean of each image loss
+        image_losses = pixel_losses.reshape(targets.shape[0], -1).mean(dim=1)
+        
+        # Apply the image weights (for hard negative mining, etc)
+        weighted_losses = image_losses * weights
+        
+        # Return mean loss
+        return weighted_losses.mean()
+
+
+def adaptive_class_weights(
+    base_weights: Tensor,
+    per_class_recall: List[float],
+    target_recall: List[float],
+    adjustment_factor: float = 0.5,
+    max_weight_multiplier: float = 1.5,
+    min_weight_multiplier: float = 0.8
+) -> Tensor:
+    """
+    Dynamically adjust class weights based on validation performance.
+    
+    This function helps balance training by increasing weights for underperforming classes
+    and decreasing weights for overperforming classes. This is particularly useful
+    for fine-tuning where the base model struggles with specific classes (shadows, thin clouds).
+    
+    Args:
+        base_weights: Starting weights [clear, thick, thin, shadow]
+        per_class_recall: Current recall for each class from validation
+        target_recall: Target recall for each class (e.g., [0.95, 0.90, 0.85, 0.85])
+        adjustment_factor: How aggressively to adjust weights (default: 0.5)
+        max_weight_multiplier: Maximum factor to increase weights (default: 1.5)
+        min_weight_multiplier: Minimum factor to decrease weights (default: 0.8)
+    
+    Returns:
+        Adjusted class weights tensor
+    
+    Example:
+        base_weights = [1.0, 1.2, 2.2, 2.8]
+        per_class_recall = [0.98, 0.92, 0.75, 0.70]  # Shadow struggling
+        target_recall = [0.95, 0.90, 0.85, 0.85]
+        # Shadow weight increases from 2.8 to ~3.5 to focus on it
+    """
+    adjusted_weights = []
+    
+    for base_w, recall, target in zip(base_weights, per_class_recall, target_recall):
+        if recall < target:
+            # Increase weight for underperforming class
+            gap = target - recall
+            multiplier = 1 + (gap * adjustment_factor)
+            multiplier = min(multiplier, max_weight_multiplier)
+            adjusted_weights.append(base_w * multiplier)
+        elif recall > target + 0.1:  # If significantly above target
+            # Decrease weight to reduce over-prediction
+            gap = recall - target - 0.1
+            multiplier = 1 - (gap * adjustment_factor * 0.5)
+            multiplier = max(multiplier, min_weight_multiplier)
+            adjusted_weights.append(base_w * multiplier)
+        else:
+            # Keep weight if within acceptable range
+            adjusted_weights.append(base_w)
+    
+    return torch.tensor(adjusted_weights, dtype=base_weights.dtype)
+
+
 class PhaseTracker(Callback):
     """
     Automatically detects and tracks transitions between frozen and unfrozen phases.
