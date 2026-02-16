@@ -360,7 +360,7 @@ model_configs = []
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
 # models_dir = project_root / "ckpts"
 # fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2.6\models")
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\tmp\from_2.80\2_stage_tr\1")
+fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\tmp\models\2")
 bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
 
 if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
@@ -1244,7 +1244,7 @@ class ModelComparator:
                     cm_minority = cm[np.ix_(minority_indices, minority_indices)]
                     minority_labels = [CLASS_NAMES[i] for i in minority_indices]
                     
-                    sns.heatmap(cm_minority, annot=True, fmt='.2f', cmap='Blues',
+                    sns.heatmap(cm_minority, annot=True, fmt='.4f', cmap='Blues',
                                xticklabels=minority_labels, yticklabels=minority_labels,
                                ax=ax, vmin=0, vmax=1)
                     ax.set_title(f'{short_name}\n(Minority Classes Only)')
@@ -1357,7 +1357,7 @@ class ModelComparator:
                     short_name = simplified_names.get(full_name, full_name)
                     cm = np.array(m.get('confusion_matrix', []))
                     if cm.size > 0:
-                        sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
+                        sns.heatmap(cm, annot=True, fmt='.4f', cmap='Blues',
                                     xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax, vmin=0, vmax=1)
                         ax.set_title(f'{short_name}')
                         ax.set_ylabel('True Label')

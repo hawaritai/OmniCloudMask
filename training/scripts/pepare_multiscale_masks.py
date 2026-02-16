@@ -215,9 +215,12 @@ def process_masks():
                 # Read GPKG
                 gdf = gpd.read_file(gpkg_path)
                 
-                if 'Remark' not in gdf.columns:
+                if not any(col in gdf.columns for col in ['Remark', 'Remake', 'Remarks', 'Renark', 'remark', 'Rewmark']):
                     logger.warning(f"  Warning: 'Remark' column missing in {gpkg_path.name}. Generating black mask.")
                 else:
+                    cols = [c for c in ['Remark', 'Remake', 'Remarks', 'Renark', 'remark', 'Rewmark'] if c in gdf.columns]
+                    if isinstance(cols, list):
+                        cols = cols[0]
                     logger.info(f"  GPKG found with {len(gdf)} features")
                     logger.info(f"  GPKG CRS: {gdf.crs}")
                     logger.info(f"  GPKG Bounds (original): {gdf.total_bounds}")
@@ -254,6 +257,8 @@ def process_masks():
                     
                     # Scale geometries from original size to current size
                     logger.info(f"  Scaling geometries to current image size...")
+                    # remove empty geometries
+                    gdf = gdf[gdf['geometry'].is_valid]
                     gdf['geometry'] = gdf['geometry'].apply(
                         lambda geom: scale(geom, xfact=scale_x, yfact=-scale_y, origin=(0, 0))
                     )
@@ -273,7 +278,7 @@ def process_masks():
                     shapes_to_burn = []
 
                     for idx, row in gdf.iterrows():
-                        raw_cls = row['Remark']
+                        raw_cls = row[cols]
 
                         if not isinstance(raw_cls, str):
                             continue

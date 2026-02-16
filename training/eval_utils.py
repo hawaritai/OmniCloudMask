@@ -161,7 +161,7 @@ def compute_and_plot_metrics(learner, dl, dataset_name, save_dir, class_names=No
     # Plot CM using sklearn
     fig, ax = plt.subplots(figsize=(10, 8))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm_norm, display_labels=class_names)
-    disp.plot(cmap='Blues', ax=ax, values_format='.2f')
+    disp.plot(cmap='Blues', ax=ax, values_format='.4f')
     ax.set_title(f'{dataset_name} Confusion Matrix (Normalized)')
     plt.tight_layout()
     plt.savefig(save_dir / f'{dataset_name.lower()}_confusion_matrix.png')

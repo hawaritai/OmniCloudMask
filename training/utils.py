@@ -2,6 +2,7 @@ from typing import Optional, List, Dict
 import logging
 import time
 import gc
+import json
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,34 @@ logger = logging.getLogger(__name__)
 # --- CONSTANTS ---
 MAX_SAVE_RETRIES = 3  # Maximum retry attempts for file operations
 SAVE_RETRY_DELAY = 0.5  # Delay between retries in seconds
+
+
+def load_image_weights_from_json(weights_file: Path) -> Dict[str, float]:
+    """
+    Load image weights from a JSON file.
+    
+    Args:
+        weights_file: Path to image_weights.json file
+        
+    Returns:
+        Dictionary mapping image filename to weight value.
+        
+    Example:
+        weights = load_image_weights_from_json(Path("train/image_weights.json"))
+        weight = weights.get("tile_0_0_image.tif", 1.0)
+    """
+    if not weights_file.exists():
+        logger.warning(f"Image weights file not found: {weights_file}")
+        return {}
+    
+    try:
+        with open(weights_file, 'r') as f:
+            weights_dict = json.load(f)
+        logger.info(f"Loaded {len(weights_dict)} image weights from {weights_file}")
+        return weights_dict
+    except Exception as e:
+        logger.error(f"Failed to load image weights from {weights_file}: {e}")
+        return {}
 
 
 class DiceMultiStrip(Metric):
@@ -1148,11 +1177,19 @@ class CompositeMetricCallback(Callback):
     - Current: 30% Dice + 35% Recall + 35% Precision (balanced)
     - This change balances false negative and false positive minimization
 
+    FIXED (2025-02-10): Proportional penalty instead of hard rejection
+    - Previous: Hard threshold - models with precision < min_precision get score = 0.0
+      This caused premature early stopping when precision failed twice in a row
+      (frozen_patience=1, both epochs showed 0.0, no improvement detected)
+    - Current: Proportional penalty - score = composite_score * (precision / min_precision)
+      This allows tracking improvements even when precision is below threshold
+      while still penalizing low precision models
+
     This callback:
     - Computes composite_score = 0.3 * dice + 0.35 * recall + 0.35 * precision
-    - Applies precision guardrail: models with precision < min_precision are rejected (score = 0.0)
-      - Previous: Proportional penalty (too weak to counteract recall bias)
-      - Current: Hard threshold - completely rejects low precision models
+    - Applies precision guardrail: models with precision < min_precision receive proportional penalty
+      - Penalty factor = precision / min_precision (e.g., precision=0.4, threshold=0.6 → penalty=0.67)
+      - This prevents premature early stopping by allowing score to still reflect improvements
     - Stores the composite score in recorder for use by other callbacks
     - Logs the composite score for monitoring
 
@@ -1161,7 +1198,7 @@ class CompositeMetricCallback(Callback):
         recall_weight: Weight for recall metric (default: 0.35, was 0.5)
         precision_weight: Weight for precision metric (default: 0.35, was 0.2)
         min_precision: Minimum precision threshold for guardrail (default: 0.6, was 0.5)
-            Models with precision below this threshold receive score = 0.0 (hard rejection)
+            Models with precision below this threshold receive proportional penalty
     """
 
     order = 55  # Run AFTER Recorder (50) but BEFORE EarlyStoppingRecall (60) and SaveBest (70)
@@ -1279,26 +1316,31 @@ class CompositeMetricCallback(Callback):
                             self.recall_weight * recall_value +
                             self.precision_weight * precision_value)
 
-            # Apply precision guardrail: if precision is below threshold, apply penalty
+            # Apply precision guardrail: if precision is below threshold, apply proportional penalty
             adjusted_score = composite_score
             precision_warning = None
 
             if precision_value < self.min_precision:
-                # FIXED: Hard threshold penalty - completely reject low precision models
-                # Previous: Soft proportional penalty (penalty_factor = precision / min_precision)
-                # Current: Hard threshold - models with precision < min_precision get score = 0
-                # This prevents models with excessive false positives from being selected
-                adjusted_score = 0.0
+                # FIXED (2025-02-10): Proportional penalty instead of hard rejection
+                # Previous: Hard threshold - models with precision < min_precision get score = 0.0
+                # This caused premature early stopping when precision failed twice in a row
+                # (frozen_patience=1, both epochs showed 0.0, no improvement detected)
+                # Current: Proportional penalty - score = composite_score * (precision / min_precision)
+                # This allows tracking improvements even when precision is below threshold
+                # while still penalizing low precision models
+                penalty_factor = precision_value / self.min_precision
+                adjusted_score = composite_score * penalty_factor
                 precision_warning = (
                     f"⚠️ PRECISION GUARDRAIL: Precision ({precision_value:.4f}) below threshold "
-                    f"({self.min_precision:.2f}). Model rejected (score set to 0.0)."
+                    f"({self.min_precision:.2f}). Applying proportional penalty: "
+                    f"score = {composite_score:.6f} × {penalty_factor:.4f} = {adjusted_score:.6f}"
                 )
                 logger.warning(f"[CompositeMetricCallback] {precision_warning}")
-                logger.info(f"[CompositeMetricCallback] Composite score: {composite_score:.6f} -> {adjusted_score:.6f}")
+                logger.info(f"[CompositeMetricCallback] Composite score: {composite_score:.6f} -> {adjusted_score:.6f} (penalty: {penalty_factor:.4f})")
 
             logger.debug(f"  composite_score = {composite_score:.6f} (dice_weight={self.dice_weight}, recall_weight={self.recall_weight}, precision_weight={self.precision_weight})")
             if adjusted_score != composite_score:
-                logger.debug(f"  adjusted_score = {adjusted_score:.6f} (hard penalty applied)")
+                logger.debug(f"  adjusted_score = {adjusted_score:.6f} (proportional penalty applied)")
 
             # CRITICAL FIX: Add composite_score to recorder values and metric_names
             # This is needed for other callbacks to see it and for it to be displayed
@@ -1852,6 +1894,39 @@ class SaveBestAndLatestModel(Callback):
             import traceback
             traceback.print_exc()
             # Don't raise exception to allow training to complete
+
+
+class GradientClip(Callback):
+    """
+    Gradient clipping callback to prevent large gradient updates.
+    
+    Prevents exploding gradients that can destabilize training,
+    especially with aggressive class weights.
+    
+    Args:
+        max_norm: Maximum gradient norm (default: 1.0)
+    """
+    order = 20  # Run before optimizer step
+    
+    def __init__(self, max_norm: float = 1.0):
+        """
+        Args:
+            max_norm: Maximum gradient norm (default: 1.0)
+        """
+        self.max_norm = max_norm
+        self.clip_count = 0
+    
+    def after_backward(self):
+        """Clip gradients after backward pass."""
+        if self.learn.model.training:
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.learn.model.parameters(),
+                self.max_norm
+            )
+            if total_norm > self.max_norm * 0.9:  # Log if near limit
+                self.clip_count += 1
+                if self.clip_count <= 10:  # Only log first 10 times
+                    logger.debug(f"[GradientClip] Gradient clipped: {total_norm:.3f} > {self.max_norm}")
 
 
 # --- HELPER FUNCTIONS FOR PHASE DETECTION ---

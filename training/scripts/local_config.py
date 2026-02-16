@@ -7,15 +7,16 @@ from pathlib import Path
 
 # Centralized Model Versioning
 # Change this in one place to affect training outputs and testing inputs
-CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v2" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
+CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v14.1" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
+# CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v10.2" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
 
 # Optimization Settings
 # Set to True if you want to use dual-resolution processing (if supported by loader)
 USE_DUAL_RES_METHOD = False
 
 # Common Root for the Dataset (Optional helper)
-_DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D")
-# _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\merged")
+# _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D")
+_DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data")
 
 # Repo Root (Optional helper, assuming this file is in training/scripts/)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,9 +24,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # ------------------------------------------------------------------------------
 # 1. prepare_masks.py
 # ------------------------------------------------------------------------------
-PREPARE_MASKS_IMAGE_DIR = _DATASET_ROOT / "images"
-PREPARE_MASKS_GPKG_DIR = _DATASET_ROOT / "gpkg"
-PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "masks"
+PREPARE_MASKS_IMAGE_DIR = _DATASET_ROOT / "all_images"
+PREPARE_MASKS_GPKG_DIR = _DATASET_ROOT / "all_gpkg"
+PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "all_masks_v6"
 
 # ------------------------------------------------------------------------------
 # 1.5. duplicate_positives.py (NEW - for dataset balancing)
@@ -40,21 +41,21 @@ DUPLICATED_MASK_DIR = _DATASET_ROOT / "duplicated" / "masks"
 PREPROCESS_BASE_DIR = _DATASET_ROOT
 
 # OPTION A: Use original images (no duplication) - 60:200 ratio
-# PREPROCESS_INPUT_IMAGES_DIR = PREPARE_MASKS_IMAGE_DIR
-# PREPROCESS_INPUT_LABELS_DIR = PREPARE_MASKS_OUTPUT_DIR
+PREPROCESS_INPUT_IMAGES_DIR = PREPARE_MASKS_IMAGE_DIR
+PREPROCESS_INPUT_LABELS_DIR = PREPARE_MASKS_OUTPUT_DIR
 
-# OPTION B: Use duplicated dataset (balanced 180:200 ratio) - RECOMMENDED
-PREPROCESS_INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR
-PREPROCESS_INPUT_LABELS_DIR = DUPLICATED_MASK_DIR
+# # OPTION B: Use duplicated dataset (balanced 180:200 ratio) - RECOMMENDED
+# PREPROCESS_INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR
+# PREPROCESS_INPUT_LABELS_DIR = DUPLICATED_MASK_DIR
 
-PREPROCESS_OUTPUT_DIR = _DATASET_ROOT / "processed_dataset_3"
+PREPROCESS_OUTPUT_DIR = _DATASET_ROOT / "processed_data_upscale_kavel_rgb_v1"
 
 # ------------------------------------------------------------------------------
 # 3. train_ocm_models_custom.py
 # ------------------------------------------------------------------------------
 # Directory containing 'train' and 'validation' folders created by preprocess
-# TRAIN_DATA_DIR = PREPROCESS_OUTPUT_DIR
-TRAIN_DATA_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\merged_v3")
+TRAIN_DATA_DIR = PREPROCESS_OUTPUT_DIR
+# TRAIN_DATA_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\merged_v3")
 
 # Path to the pretrained weights (checkpoint)
 TRAIN_PRETRAINED_WEIGHTS_PATH = _REPO_ROOT / "ckpts" / "PM_model_OCM_6.43_RG_NIR_regnety_004.pycls_in1k_PT_state.safetensors"

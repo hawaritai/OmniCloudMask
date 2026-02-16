@@ -11,6 +11,8 @@ import torch
 import warnings
 import cv2
 import logging
+import json
+from typing import Dict
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -77,6 +79,21 @@ except ImportError:
 # Target size for smallest dimension
 TARGET_SIZE = 509
 
+# --- IMAGE WEIGHTS CONFIGURATION ---
+# Image weight lists paths
+GT_LIST_PATH = Path("training/data/gt_list.txt")
+FN_LIST_PATH = Path("training/data/fn_list.txt")
+HARD_NEGATIVES_LIST_PATH = Path("training/data/hard_negatives_list.txt")
+
+# Image weight values
+# UPDATED (2025-02-13): Optimized for 95%+ recall with 50-60% precision
+WEIGHT_GT = 1.0           # Ground Truth (baseline)
+WEIGHT_FN = 2.0           # False Negatives (reduced from 3.0 to 2.0 - less aggressive FN learning)
+WEIGHT_HARD_NEGATIVE = 2.0  # Hard Negatives (increased from 0.3 to 0.6 - penalize FPs more)
+
+USE_NIR = False
+# ---------------------------------
+
 def calculate_target_dimensions(curr_h, curr_w, target_size=509):
     """
     Calculate new dimensions where smallest side = target_size, preserving aspect ratio.
@@ -99,6 +116,58 @@ def calculate_target_dimensions(curr_h, curr_w, target_size=509):
     
     return new_h, new_w
 
+
+def load_image_weights_from_lists() -> Dict[str, float]:
+    """
+    Load image weights from GT, FN, and Hard Negatives list files.
+    
+    Supports all image formats (.tif, .png, .jpg, .iiq, etc.) as long as
+    filenames in the list files match the source image stems (without extension).
+    
+    Returns:
+        Dictionary mapping image stem (without extension) to weight value.
+    """
+    image_weights = {}
+    
+    # Load GT images (weight = WEIGHT_GT)
+    if GT_LIST_PATH.exists():
+        with open(GT_LIST_PATH, 'r') as f:
+            for line in f:
+                img_stem = line.strip()
+                if img_stem:
+                    image_weights[img_stem] = WEIGHT_GT
+        gt_count = len([k for k, v in image_weights.items() if v == WEIGHT_GT])
+        logger.info(f"Loaded {gt_count} GT images (weight={WEIGHT_GT}) from {GT_LIST_PATH}")
+    else:
+        logger.warning(f"GT list not found: {GT_LIST_PATH}")
+    
+    # Load FN images (weight = WEIGHT_FN)
+    if FN_LIST_PATH.exists():
+        with open(FN_LIST_PATH, 'r') as f:
+            for line in f:
+                img_stem = line.strip()
+                if img_stem:
+                    image_weights[img_stem] = WEIGHT_FN
+        fn_count = len([k for k, v in image_weights.items() if v == WEIGHT_FN])
+        logger.info(f"Loaded {fn_count} FN images (weight={WEIGHT_FN}) from {FN_LIST_PATH}")
+    else:
+        logger.warning(f"FN list not found: {FN_LIST_PATH}")
+    
+    # Load Hard Negative images (weight = WEIGHT_HARD_NEGATIVE)
+    if HARD_NEGATIVES_LIST_PATH.exists():
+        with open(HARD_NEGATIVES_LIST_PATH, 'r') as f:
+            for line in f:
+                img_stem = line.strip()
+                if img_stem:
+                    image_weights[img_stem] = WEIGHT_HARD_NEGATIVE
+        hn_count = len([k for k, v in image_weights.items() if v == WEIGHT_HARD_NEGATIVE])
+        logger.info(f"Loaded {hn_count} Hard Negative images (weight={WEIGHT_HARD_NEGATIVE}) from {HARD_NEGATIVES_LIST_PATH}")
+    else:
+        logger.warning(f"Hard Negatives list not found: {HARD_NEGATIVES_LIST_PATH}")
+    
+    logger.info(f"Total images with weights: {len(image_weights)}")
+    return image_weights
+
 # --- PREPROCESSING METHOD TOGGLE ---
 # False: Use RGBNIRHandler with normalization (Method A)
 # True: Use Clamp & Scale (Red*3, Green*2, NIR*1) (Method B)
@@ -111,6 +180,16 @@ def preprocess_images():
     logger.info(f"Using device: {device}")
     logger.info(f"Preprocessing Method: {'Clamp & Scale (Method B)' if USE_METHOD_B_PREPROCESSING else 'RGBNIRHandler (Method A)'}")
 
+    # --- LOAD IMAGE WEIGHTS ---
+    image_weights = load_image_weights_from_lists()
+    
+    # Track weights per split for saving JSON files
+    split_weights = {
+        "train": {},
+        "validation": {},
+        "test": {}
+    }
+    
     # Initialize Handler (only needed for Method A)
     handler = RGBNIRHandler(device=device) if not USE_METHOD_B_PREPROCESSING else None
 
@@ -189,13 +268,14 @@ def preprocess_images():
                 else:
                     rgb_for_gan_u8 = rgb_for_gan
 
-                # Now run GAN
-                nir_synthetic = get_NIR(rgb_for_gan_u8, device=device)
-                
-                # --- RESIZE NIR TO MATCH RGB IF NEEDED ---
-                if nir_synthetic.shape != (new_h, new_w):
-                    nir_synthetic = nir_synthetic.astype(np.float32)
-                    nir_synthetic = cv2.resize(nir_synthetic, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                if USE_NIR:
+                    # Now run GAN
+                    nir_synthetic = get_NIR(rgb_for_gan_u8, device=device)
+                    
+                    # --- RESIZE NIR TO MATCH RGB IF NEEDED ---
+                    if nir_synthetic.shape != (new_h, new_w):
+                        nir_synthetic = nir_synthetic.astype(np.float32)
+                        nir_synthetic = cv2.resize(nir_synthetic, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
                 # --- STACKING LOGIC ---
                 if USE_METHOD_B_PREPROCESSING:
@@ -235,15 +315,19 @@ def preprocess_images():
                     # --- METHOD A: RGBNIRHandler (Normalized) ---
                     red = data_img_rgb[0].astype(np.float32)
                     green = data_img_rgb[1].astype(np.float32)
+                    blue = data_img_rgb[2].astype(np.float32)
                     
-                    rgn_stack = handler.stack_rgb_nir(
-                        red=red,
-                        green=green,
-                        nir=nir_synthetic,
-                        # normalize=True,
-                        # scale_to_dn=True,
-                        # dn_range=(0, 10000)
-                    )
+                    if USE_NIR:
+                        rgn_stack = handler.stack_rgb_nir(
+                            red=red,
+                            green=green,
+                            nir=nir_synthetic,
+                            # normalize=True,
+                            # scale_to_dn=True,
+                            # dn_range=(0, 10000)
+                        )
+                    else:
+                        rgn_stack = np.stack([((red / 255.0) * 10000.0), ((green / 255.0) * 10000.0),  ((blue / 255.0) * 10000.0)], axis=0)
 
                 # Tile into 509×509 patches
                 # Calculate number of tiles
@@ -296,6 +380,13 @@ def preprocess_images():
                         out_img_path = OUTPUT_DIR / split_dir / f"{base_name}_image.tif"
                         out_lbl_path = OUTPUT_DIR / split_dir / f"{base_name}_label.tif"
                         
+                        # Get image weight based on source image stem (default to 1.0 if not in list)
+                        img_weight = image_weights.get(img_path.stem, 1.0)
+                        
+                        # Store weight for this tile
+                        tile_weight_key = f"{base_name}_image.tif"
+                        split_weights[split_dir][tile_weight_key] = img_weight
+                        
                         # Identity transform for pixel coordinates
                         dst_transform = rasterio.Affine(1, 0, 0, 0, 1, 0)
                         
@@ -339,6 +430,13 @@ def preprocess_images():
             import traceback
             traceback.print_exc()
             stats["skipped"] += 1
+    
+    # --- SAVE IMAGE WEIGHTS TO JSON FILES ---
+    for split_dir, weights_dict in split_weights.items():
+        weights_path = OUTPUT_DIR / split_dir / "image_weights.json"
+        with open(weights_path, 'w') as f:
+            json.dump(weights_dict, f, indent=2)
+        logger.info(f"Saved {len(weights_dict)} tile weights to {weights_path}")
     
     # Print summary
     logger.info("\n" + "="*80)
