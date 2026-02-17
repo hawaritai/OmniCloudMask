@@ -65,62 +65,33 @@ try:
         TRAIN_DATA_DIR,
         BAND_ORDER,
         USE_DUAL_RES_METHOD,
-        CUSTOM_MODEL_VERSION
+        CUSTOM_MODEL_VERSION,
+        COMPARISON_QUICK_TEST,
+        COMPARISON_QUICK_TEST_SAMPLES,
+        COMPARISON_BATCH_SIZE,
+        COMPARISON_USE_BF16,
+        COMPARISON_FINE_TUNED_MODELS_DIR,
+        COMPARISON_BASE_MODEL_DIR,
+        MODEL_CONFIG,
+        INFERENCE_CONFIG,
+        CLASS_NAMES,
+        SMP_MODEL_TYPES,
+        FASTAI_MODEL_TYPES,
+        MAX_SAVE_RETRIES,
+        SAVE_RETRY_DELAY,
+        GENERATE_SYNTHETIC_NIR,
+        TARGET_SIZE
     )
-    
-    # Try to import comparison specific configs if they exist, otherwise use defaults
-    try:
-        from local_config import (
-            COMPARISON_QUICK_TEST,
-            COMPARISON_QUICK_TEST_SAMPLES,
-            COMPARISON_BATCH_SIZE,
-            COMPARISON_USE_BF16,
-            MODEL_CONFIG,
-            INFERENCE_CONFIG
-        )
-    except ImportError:
-        COMPARISON_QUICK_TEST = False
-        COMPARISON_QUICK_TEST_SAMPLES = 50
-        COMPARISON_BATCH_SIZE = 12
-        COMPARISON_USE_BF16 = False
-        MODEL_CONFIG = {
-            "v4": {"model_library": "smp"},
-            "v3": {"model_library": "fastai"}
-        }
-        INFERENCE_CONFIG = {
-            "compile_models": False,
-            "compile_mode": "default",
-            "inference_dtype": "float32"
-        }
-        
-except ImportError:
-    logger.critical("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py'.")
+except ImportError as e:
+    logger.critical(f"CRITICAL: local_config.py not found or missing required config: {e}. Please create 'training/scripts/local_config.py'.")
     sys.exit(1)
 
 # --- CONSTANTS ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATCH_SIZE = (509, 509)
+MODEL_PATCH_SIZE = (TARGET_SIZE, TARGET_SIZE)
 NUM_CHANNELS = 3
-CLASS_NAMES = ['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
-GENERATE_SYNTHETIC_NIR = False # Set to False for comparison script as we assume processed data
-MAX_SAVE_RETRIES = 3  # Maximum retry attempts for file operations
-SAVE_RETRY_DELAY = 0.5  # Delay between retries in seconds
-
-
-# --- MODEL TYPE MAPPINGS ---
-# Mapping for v4 smp models (timm-unet style)
-SMP_MODEL_TYPES = {
-    'regnety': 'tu-regnety_004',
-    'edgenext': 'tu-edgenext_small',
-    'convnext': 'tu-convnextv2_nano',
-}
-
-# Mapping for v3 fastai models
-FASTAI_MODEL_TYPES = {
-    'regnety': 'regnety_004.pycls_in1k',
-    'edgenext': 'edgenext_small.usi_in1k',
-    'convnext': 'convnextv2_nano.fcmae_ft_in1k',
-}
+# Note: CLASS_NAMES, SMP_MODEL_TYPES, FASTAI_MODEL_TYPES, MAX_SAVE_RETRIES, SAVE_RETRY_DELAY are now imported from local_config.py
+# GENERATE_SYNTHETIC_NIR = False # Set to False for comparison script as we assume processed data
 
 
 # --- OPTIONAL COMPILATION SUPPORT ---
@@ -358,14 +329,13 @@ def simplify_model_name(full_name: str) -> str:
 model_configs = []
 
 # Auto-discover models from models directory using the improved discover_model_checkpoints function
-# models_dir = project_root / "ckpts"
-# fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\fine_tuning_results_OCM_test1x_kavel_n_cloudsen_v10.1.2.6\models")
-fine_tuned_models_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\fine_tune_results\tmp\models\2")
-bsae_model_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\ckpts")
+# Use directories from local_config
+fine_tuned_models_dir = COMPARISON_FINE_TUNED_MODELS_DIR
+base_model_dir = COMPARISON_BASE_MODEL_DIR
 
-if fine_tuned_models_dir.exists() or bsae_model_dir.exists():
+if fine_tuned_models_dir.exists() or base_model_dir.exists():
     discovered_fined_tuned_models = discover_model_checkpoints(fine_tuned_models_dir)
-    discovered_models = discover_model_checkpoints(bsae_model_dir)
+    discovered_models = discover_model_checkpoints(base_model_dir)
     model_configs.extend(discovered_fined_tuned_models)
     model_configs.extend(discovered_models)
 

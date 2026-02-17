@@ -60,39 +60,26 @@ try:
     from local_config import (
         PREPROCESS_INPUT_IMAGES_DIR,
         PREPROCESS_INPUT_LABELS_DIR,
-        PREPROCESS_OUTPUT_DIR
+        PREPROCESS_OUTPUT_DIR,
+        TARGET_SIZE,
+        GT_LIST_PATH,
+        FN_LIST_PATH,
+        HARD_NEGATIVES_LIST_PATH,
+        WEIGHT_GT,
+        WEIGHT_FN,
+        WEIGHT_HARD_NEGATIVE,
+        USE_METHOD_B_PREPROCESSING,
+        GENERATE_SYNTHETIC_NIR
     )
-
-    # INPUT_IMAGES_DIR = Path(r"E:\ImageQC\dataset\Test_all_gt\images_pos")
-    # INPUT_LABELS_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_masks")
-    # OUTPUT_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\processed_data_upscale")
 
     INPUT_IMAGES_DIR = PREPROCESS_INPUT_IMAGES_DIR
     INPUT_LABELS_DIR = PREPROCESS_INPUT_LABELS_DIR
     OUTPUT_DIR = PREPROCESS_OUTPUT_DIR
     
-except ImportError:
-    logger.critical("CRITICAL: local_config.py not found.")
+except ImportError as e:
+    logger.critical(f"CRITICAL: local_config.py not found or missing required config: {e}")
     logger.critical("Required variables: PREPROCESS_INPUT_IMAGES_DIR, PREPROCESS_INPUT_LABELS_DIR, PREPROCESS_OUTPUT_DIR")
     sys.exit(1)
-
-# Target size for smallest dimension
-TARGET_SIZE = 509
-
-# --- IMAGE WEIGHTS CONFIGURATION ---
-# Image weight lists paths
-GT_LIST_PATH = Path("training/data/gt_list.txt")
-FN_LIST_PATH = Path("training/data/fn_list.txt")
-HARD_NEGATIVES_LIST_PATH = Path("training/data/hard_negatives_list.txt")
-
-# Image weight values
-# UPDATED (2025-02-13): Optimized for 95%+ recall with 50-60% precision
-WEIGHT_GT = 1.0           # Ground Truth (baseline)
-WEIGHT_FN = 2.0           # False Negatives (reduced from 3.0 to 2.0 - less aggressive FN learning)
-WEIGHT_HARD_NEGATIVE = 2.0  # Hard Negatives (increased from 0.3 to 0.6 - penalize FPs more)
-
-USE_NIR = False
-# ---------------------------------
 
 def calculate_target_dimensions(curr_h, curr_w, target_size=509):
     """
@@ -167,12 +154,6 @@ def load_image_weights_from_lists() -> Dict[str, float]:
     
     logger.info(f"Total images with weights: {len(image_weights)}")
     return image_weights
-
-# --- PREPROCESSING METHOD TOGGLE ---
-# False: Use RGBNIRHandler with normalization (Method A)
-# True: Use Clamp & Scale (Red*3, Green*2, NIR*1) (Method B)
-USE_METHOD_B_PREPROCESSING = False 
-# ---------------------
 
 def preprocess_images():
     # Setup Device
@@ -268,7 +249,7 @@ def preprocess_images():
                 else:
                     rgb_for_gan_u8 = rgb_for_gan
 
-                if USE_NIR:
+                if GENERATE_SYNTHETIC_NIR:
                     # Now run GAN
                     nir_synthetic = get_NIR(rgb_for_gan_u8, device=device)
                     
@@ -317,7 +298,7 @@ def preprocess_images():
                     green = data_img_rgb[1].astype(np.float32)
                     blue = data_img_rgb[2].astype(np.float32)
                     
-                    if USE_NIR:
+                    if GENERATE_SYNTHETIC_NIR:
                         rgn_stack = handler.stack_rgb_nir(
                             red=red,
                             green=green,

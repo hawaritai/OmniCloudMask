@@ -25,73 +25,23 @@ try:
     from local_config import (
         PREPARE_MASKS_IMAGE_DIR,
         PREPARE_MASKS_GPKG_DIR,
-        PREPARE_MASKS_OUTPUT_DIR
+        PREPARE_MASKS_OUTPUT_DIR,
+        PREPARE_MASKS_TFW_DIR,
+        PROJECT_CONFIGS,
+        CLASS_MAPPING,
+        SYNONYMS,
     )
-    # IMAGE_DIR = Path(r"E:\ImageQC\dataset\Test_all_gt\images_pos")
-    # GPKG_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_gpkg")
-    # OUTPUT_DIR = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_masks")
     IMAGE_DIR = PREPARE_MASKS_IMAGE_DIR
     GPKG_DIR = PREPARE_MASKS_GPKG_DIR
     OUTPUT_DIR = PREPARE_MASKS_OUTPUT_DIR
-    TFW_DIR = Path(r"Q:\02_PROJECTS\2051_102025082_D82_Tarn-et-Garonne_A\60_UM\LVL03_CertiflAI_0610")
+    TFW_DIR = PREPARE_MASKS_TFW_DIR
     
-except ImportError:
-    logger.error("CRITICAL: local_config.py not found. Please create 'training/scripts/local_config.py' to define local paths.")
+except ImportError as e:
+    logger.error(f"CRITICAL: local_config.py not found or missing required config: {e}. Please create 'training/scripts/local_config.py' to define local paths.")
     import sys
     sys.exit(1)
 
-# --- PROJECT CONFIGURATIONS ---
-# Map project codes to their original resolutions
-# Format: "project_code": (original_width, original_height)
-PROJECT_CONFIGS = {
-    "D82A": {  # Garonne_A - LEGACY with .tfw
-        "original_size": (9370, 6020),
-        "current_size": (640, 411),
-        "has_tfw": True,  # Special handling for geo-coordinates
-        "description": "2051_102025082_D82_Tarn-et-Garonne_A (LEGACY)"
-    },
-    "D09E": {  # Arriege_E
-        "original_size": (4000, 2571),
-        "current_size": (640, 411),
-        "has_tfw": False,
-        "description": "2051_102025077_D09_Arriege_E"
-    },
-    "D09D": {  # Arriege_D
-        "original_size": (8820, 5668),
-        "current_size": (640, 411),
-        "has_tfw": False,
-        "description": "2051_102025077_D09_Arriege_D"
-    },
-    "FHSTG": {  # AIR_FHSTG
-        "original_size": (1681, 1080),
-        "current_size": (640, 411),
-        "has_tfw": False,
-        "description": "2025_08_03_AIR_FHSTG"
-    },
-    "PHKIO": {  # AIR_PHKIO
-        "original_size": (640, 480),
-        "current_size": (640, 480),
-        "has_tfw": False,
-        "description": "2025_08_10_AIR_PHKIO"
-    }
-}
-
-# CLASS MAPPING
-# 'Remark' attribute values -> Integer Class ID
-CLASS_MAPPING = {
-    'Cloud Deep': 1,
-    'Cloud Lite': 2,
-    'Shadow': 3
-}
-
-# Synonym normalization (extendable)
-SYNONYMS = {
-    'light': 'lite',
-    'lite': 'lite',
-    'deep': 'deep',
-    'cloud': 'cloud',
-    'shadow': 'shadow'
-}
+# Note: PROJECT_CONFIGS, CLASS_MAPPING, and SYNONYMS are now imported from local_config.py
 
 def detect_project_type(filename):
     """
@@ -118,7 +68,10 @@ def detect_project_type(filename):
     
     # Pattern for FHSTG: contains "qvRGB"
     if "qvRGB" in filename:
-        return "FHSTG"
+        if ".tif" in filename:
+            return "GLSDF"
+        else:
+            return "FHSTG"
     
     # Pattern for PHKIO: contains .iiq
     if ".iiq" in filename:

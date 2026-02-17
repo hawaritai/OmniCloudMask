@@ -179,24 +179,8 @@ except ImportError as e:
 
 # --- CONSTANTS ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CLASS_NAMES = ['Clear', 'Thick Cloud', 'Thin Cloud', 'Cloud Shadow']
+# Note: CLASS_NAMES, SMP_MODEL_TYPES, FASTAI_MODEL_TYPES are now imported from local_config.py
 # Note: MAX_SAVE_RETRIES and SAVE_RETRY_DELAY are now imported from utils.py
-
-
-# --- MODEL TYPE MAPPINGS ---
-# Mapping for v4 smp models (timm-unet style)
-SMP_MODEL_TYPES = {
-    'regnety': 'tu-regnety_004',
-    'edgenext': 'tu-edgenext_small',
-    'convnext': 'tu-convnextv2_nano',
-}
-
-# Mapping for v3 fastai models
-FASTAI_MODEL_TYPES = {
-    'regnety': 'regnety_004.pycls_in1k',
-    'edgenext': 'edgenext_small.usi_in1k',
-    'convnext': 'convnextv2_nano.fcmae_ft_in1k',
-}
 
 def create_learner(model, dls, callbacks, loss_func, metrics):
     """Create learner without splitter - using manual freezing instead."""
@@ -1864,37 +1848,51 @@ def calculate_image_difficulty(
     
     return difficulties
 
-
+# --- LOCAL CONFIG IMPORT ---
+try:
+    if str(current_script_dir) not in sys.path:
+        sys.path.append(str(current_script_dir))
+    from local_config import (
+        TRAIN_DATA_DIR,
+        CUSTOM_MODEL_VERSION,
+        USE_DUAL_RES_METHOD,
+        BAND_ORDER,
+        CLASS_NAMES,
+        SMP_MODEL_TYPES,
+        FASTAI_MODEL_TYPES,
+        CKPTS_DIR,
+        USE_BF16,
+        DEMO_MODE,
+        COMPILE_MODELS,
+        ORIGINAL_IMAGE_SIZE,
+        MAX_CLIP_IMAGE_SIZE,
+        MIN_CLIP_IMAGE_SIZE,
+        BATCH_SIZE,
+        GRADIENT_ACCUMULATION_BATCH_SIZE,
+        LEARNING_RATE,
+        FREEZE_EPOCHS,
+        UNFROZEN_EPOCHS,
+        RANDOM_SEED,
+        CLASS_WEIGHTS,
+        LIMIT_TRAINING_IMAGES,
+        get_native_band_scales,
+        get_accumulation_steps,
+        get_num_input_channels,
+        get_class_weights_tensor,
+    )
+except ImportError as e:
+    logger.critical(
+        f"CRITICAL: local_config.py not found or missing required config: {e}. "
+        "Please create 'training/scripts/local_config.py' to define local paths."
+    )
+    sys.exit(1)
+    
 def main():
     """Main function to fine-tune multiple models."""
     logger.info("Starting multi-model fine-tuning script...")
     print_system_info()
     
     warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
-    
-    # --- LOCAL CONFIG IMPORT ---
-    try:
-        if str(current_script_dir) not in sys.path:
-            sys.path.append(str(current_script_dir))
-        from local_config import (
-            TRAIN_DATA_DIR,
-            CUSTOM_MODEL_VERSION,
-            USE_DUAL_RES_METHOD,
-        )
-        
-        # Try to import BAND_ORDER, default to [1, 2, 3] if not present
-        from local_config import BAND_ORDER
-    except ImportError:
-        # Check if basic config exists, if not exit
-        try:
-            from local_config import TRAIN_DATA_DIR
-            BAND_ORDER = [1, 2, 3]  # Default
-        except ImportError:
-            logger.critical(
-                "CRITICAL: local_config.py not found. Please create "
-                "'training/scripts/local_config.py' to define local paths."
-            )
-            sys.exit(1)
     
     # --- PATHS ---
     base_data_path = TRAIN_DATA_DIR
@@ -1906,10 +1904,8 @@ def main():
     cloudsen12_validation_dir = my_custom_val_dir
     
     # --- CHECKPOINTS DIRECTORY ---
-    # Default ckpts directory in project root
-    ckpts_dir = project_root / "ckpts"
-    
-    # Allow override via environment variable
+    # Use ckpts directory from config (allows override via environment variable)
+    ckpts_dir = CKPTS_DIR
     if "CKPTS_DIR" in os.environ:
         ckpts_dir = Path(os.environ["CKPTS_DIR"])
     
@@ -1921,37 +1917,33 @@ def main():
     # --- CONFIGURATION ---
     model_version = CUSTOM_MODEL_VERSION
     
-    use_bf16 = True
-    demo_mode = False
+    use_bf16 = USE_BF16
+    demo_mode = DEMO_MODE
     
     # Optional: Enable model compilation for v4 smp models
-    compile_models = False  # Set to True to enable compilation
+    compile_models = COMPILE_MODELS
     
-    original_image_size = 509
-    max_clip_image_clip_size = 400
-    min_clip_image_size = 256
+    original_image_size = ORIGINAL_IMAGE_SIZE
+    max_clip_image_clip_size = MAX_CLIP_IMAGE_SIZE
+    min_clip_image_size = MIN_CLIP_IMAGE_SIZE
     
     # Use configurable band order
     limited_band_read_list = BAND_ORDER
     logger.info(f"Training using bands: {limited_band_read_list}")
     
-    # Scale bands according to method:
-    # Dual Res method uses [Red*3, Green*2, NIR*1] scaling instead of Z-score
-    if USE_DUAL_RES_METHOD:
-        native_band_scales = [3, 2, 1]
-    else:
-        native_band_scales = [1, 1, 1]
+    # Scale bands according to method from config
+    native_band_scales = get_native_band_scales()
     
-    gradient_accumulation_batch_size = 128
-    batch_size = 10
-    accum_steps = gradient_accumulation_batch_size // batch_size  # 21
+    gradient_accumulation_batch_size = GRADIENT_ACCUMULATION_BATCH_SIZE
+    batch_size = BATCH_SIZE
+    accum_steps = get_accumulation_steps()
 
-    # PHASE 1: Higher learning rate for faster convergence (0.0003 vs 0.0001)
-    # Expected: +2-3% Recall, faster training convergence
-    learning_rate = 0.0003
+    # Learning rate from config
+    learning_rate = LEARNING_RATE
 
-    RANDOM_SEED = 42
+    random_seed = RANDOM_SEED
 
+    # Class weights from config
     # UPDATED (2025-02-13): Class weights for RECALL-PRECISION BALANCED training with image weights
     # [Clear, Thick Cloud, Thin Cloud, Cloud Shadow]
     # Previous: [1, 1.5, 2.5, 3.0] - 3:1 ratio, recall-focused
@@ -1964,7 +1956,7 @@ def main():
     #   - Achieves 95%+ recall while maintaining 50-60% precision
     #   - Uses 6:1 ratio for critical classes (more balanced than 15:1)
     #   - Expected: 95-97% Recall, 52-58% Precision
-    CLASS_WEIGHTS = torch.tensor([1.0, 1.5, 3.0, 3.0])
+    CLASS_WEIGHTS = get_class_weights_tensor()
     logger.info(f"Class weights: {CLASS_WEIGHTS.tolist()}")
     logger.info(f"  - Ratio: {CLASS_WEIGHTS[3]/CLASS_WEIGHTS[0]:.1f}:1 (Critical:Clear)")
     logger.info(f"  - NEW: Balanced recall-precision with image weights (6:1 ratio)")
@@ -1991,6 +1983,12 @@ def main():
         if not dataset_dir.exists():
             logger.warning(f"Warning: Directory {dataset_dir} does not exist. Please check paths.")
     
+    # Use epoch settings from config
+    freeze_epochs = FREEZE_EPOCHS
+    unfrozen_epochs = UNFROZEN_EPOCHS
+    limit_training_images = LIMIT_TRAINING_IMAGES
+    
+    # Override for demo mode
     if demo_mode:
         freeze_epochs = 5
         unfrozen_epochs = 5
@@ -2000,11 +1998,11 @@ def main():
         # Previous: 10 unfrozen epochs - Recall-focused training
         # NEW: 12 unfrozen epochs - Slightly longer for convergence with balanced weights
         # ReduceLROnPlateau callback will automatically reduce LR when model saturates
-        freeze_epochs = 5
-        unfrozen_epochs = 12
-        limit_training_images = None
+        freeze_epochs = FREEZE_EPOCHS
+        unfrozen_epochs = UNFROZEN_EPOCHS
+        limit_training_images = LIMIT_TRAINING_IMAGES
     
-    num_input_channels = len(limited_band_read_list)
+    num_input_channels = get_num_input_channels()
     logger.info(f"Number of input channels: {num_input_channels}")
     
     # --- DISCOVER MODELS ---
@@ -2054,7 +2052,7 @@ def main():
             'cloudsen12_validation_dir': cloudsen12_validation_dir,
             'label_weights': label_weights,
             'class_weights': CLASS_WEIGHTS,  # Add class weights for recall-focused training
-            'random_seed': RANDOM_SEED,
+            'random_seed': random_seed,
         }
         
         # UPDATED (2025-02-13): Use single-phase training with optimized image/class weights
