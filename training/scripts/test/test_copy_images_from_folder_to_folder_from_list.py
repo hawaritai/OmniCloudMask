@@ -2,9 +2,9 @@ from pathlib import Path
 import shutil
 
 # paths
-input_dir = Path(r"Q:\02_PROJECTS\2051_102025077_D09_Arriege_D\60_UM\LVL03_CertiFLAI")
+input_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_data\2025_08_10_AIR_PHKIO\gsd_100cm")
 names_txt = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\scripts\test\tmp.txt")
-output_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D\images")
+output_dir = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\all_images_v3")
 
 output_dir.mkdir(parents=True, exist_ok=True)
 
