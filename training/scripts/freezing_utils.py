@@ -119,22 +119,38 @@ def print_frozen_status(learner):
     print(f"{'='*60}\n")
 
 
-def get_lr_ranges(freeze_encoder: bool = True):
+def get_lr_ranges(freeze_encoder: bool = True, training_config: dict = None):
     """
     Get learning rates for frozen vs unfrozen phases.
     
     Args:
         freeze_encoder: Whether encoder is frozen
+        training_config: Optional training config with custom LR values
         
     Returns:
         float or slice:
-            - 1e-3 if frozen (single LR for decoder)
-            - slice(1e-5, 1e-2) if unfrozen (discriminative LRs)
+            - Single LR if frozen (decoder only)
+            - slice(encoder_lr, decoder_lr) if unfrozen (discriminative LRs)
     """
-    if freeze_encoder:
-        return 1e-3
+    # Default values for fine-tuning
+    lr_frozen_default = 1e-3
+    lr_encoder_default = 1e-5
+    lr_decoder_default = 1e-2
+    
+    # Use config values if provided
+    if training_config is not None:
+        lr_frozen = training_config.get('lr_frozen', lr_frozen_default)
+        lr_encoder = training_config.get('lr_encoder', lr_encoder_default)
+        lr_decoder = training_config.get('lr_decoder', lr_decoder_default)
     else:
-        return slice(1e-5, 1e-2)
+        lr_frozen = lr_frozen_default
+        lr_encoder = lr_encoder_default
+        lr_decoder = lr_decoder_default
+    
+    if freeze_encoder:
+        return lr_frozen
+    else:
+        return slice(lr_encoder, lr_decoder)
 
 
 def inspect_model_structure(learner):

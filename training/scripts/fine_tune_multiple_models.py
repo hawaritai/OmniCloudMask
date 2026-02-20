@@ -147,6 +147,10 @@ try:
         RandomSharpenBlur,
         ClipHighAndLow,
         BatchFlip,
+        # NEW: Cloud-specific augmentations for training from scratch
+        RandomBrightnessContrast,
+        RandomBandDropout,
+        CloudAwareCutout,
     )
     from utils import (
         DiceMultiStrip,
@@ -364,7 +368,8 @@ def load_model_for_training(
     model_config: Dict,
     num_input_channels: int,
     use_bf16: bool,
-    compile_model: bool = False
+    compile_model: bool = False,
+    use_imagenet_encoder: bool = False
 ) -> Optional[torch.nn.Module]:
     """
     Load a model checkpoint using the modern loading mechanism.
@@ -374,30 +379,41 @@ def load_model_for_training(
         num_input_channels: Number of input channels
         use_bf16: Whether to use bfloat16 precision
         compile_model: Whether to compile the model (v4 only)
+        use_imagenet_encoder: Whether to use ImageNet pretrained encoder (no checkpoint loading)
         
     Returns:
         Loaded model or None if failed
     """
     model_name = model_config['name']
-    checkpoint_path = model_config['path']
+    checkpoint_path = model_config.get('path')  # May be None for ImageNet encoder
     model_type = model_config['model_type']
-    model_library = model_config['model_library']
+    model_library = model_config.get('model_library', 'smp')
     
-    logger.info(f"Loading model: {model_name} from {checkpoint_path}")
-    logger.info(f"  Model type: {model_type} ({model_library})")
+    if use_imagenet_encoder:
+        logger.info(f"Creating model with ImageNet pretrained encoder: {model_type}")
+        logger.info(f"  Model type: {model_type} ({model_library})")
+    else:
+        logger.info(f"Loading model: {model_name} from {checkpoint_path}")
+        logger.info(f"  Model type: {model_type} ({model_library})")
     
     try:
-        # Create model architecture using build_custom_model
+        # Create model architecture with ImageNet encoder if requested
         model = build_custom_model(
             model_name=model_type,
             model_library=model_library,
             in_chans=num_input_channels,
-            n_out=len(CLASS_NAMES)
+            n_out=len(CLASS_NAMES),
+            encoder_weights='imagenet' if use_imagenet_encoder else None
         )
         
-        # Load weights with device parameter
-        load_custom_weights(model, checkpoint_path, device=DEVICE, strict=False)
-        logger.info("  Successfully loaded checkpoint weights.")
+        # Only load checkpoint weights if NOT using ImageNet encoder
+        if not use_imagenet_encoder:
+            load_custom_weights(model, checkpoint_path, device=DEVICE, strict=False)
+            logger.info("  Successfully loaded checkpoint weights.")
+        else:
+            # Move model to DEVICE when using ImageNet encoder (no checkpoint loading)
+            model = model.to(DEVICE)
+            logger.info("  Using ImageNet pretrained encoder (fresh decoder).")
         
         # Set model to train mode for training
         model.train()
@@ -451,6 +467,9 @@ def fine_tune_single_model(
     model_type = model_config['model_type']
     model_library = model_config['model_library']
     
+    # Get parameters from training_config with defaults for fine-tuning
+    use_imagenet_encoder = training_config.get('use_imagenet_encoder', False)
+    
     logger.info(f"\n{'='*60}")
     logger.info(f"Fine-tuning model: {model_name}")
     logger.info(f"Checkpoint: {checkpoint_path}")
@@ -463,7 +482,8 @@ def fine_tune_single_model(
             model_config,
             num_input_channels=training_config['num_input_channels'],
             use_bf16=training_config['use_bf16'],
-            compile_model=training_config.get('compile_models', False)
+            compile_model=training_config.get('compile_models', False),
+            use_imagenet_encoder=training_config.get('use_imagenet_encoder', False)
         )
         
         if model is None:
@@ -694,13 +714,23 @@ def fine_tune_single_model(
                 max_scale=1.111, min_scale=0.07, plateau_min=0.33, plateau_max=1.0
             ),
             RandomClipLargeImages(
-                max_size=training_config['max_clip_image_clip_size'],
+                max_size=training_config['max_clip_image_size'],
                 min_size=training_config['min_clip_image_size']
             ),
             BatchFlip(),
             RandomSharpenBlur(min_factor=0.5, max_factor=1.5),
             ClipHighAndLow(p=0.1, max_pct=0.05),
         ]
+        
+        # Add cloud-specific augmentations for training from scratch
+        if use_imagenet_encoder:
+            # More aggressive augmentation for training from scratch
+            batch_tfms.extend([
+                RandomBrightnessContrast(p=0.5, brightness_range=0.2, contrast_range=0.2),
+                # RandomBandDropout(p=0.1, max_bands_to_drop=1),
+                CloudAwareCutout(p=0.3, max_area_ratio=0.2, min_area_ratio=0.05),
+            ])
+            logger.info("Added cloud-specific augmentations for training from scratch")
         
         # --- DATALOADER ---
         logger.info("Creating DataBlock...")
@@ -740,15 +770,43 @@ def fine_tune_single_model(
             return False
         
         # --- TRAINING ---
+        # # Get parameters from training_config with defaults for fine-tuning
+        # use_imagenet_encoder = training_config.get('use_imagenet_encoder', False)
+        
+        # Composite score weights - use config values for from-scratch training
+        composite_dice = training_config.get('composite_dice_weight', 0.2)
+        composite_recall = training_config.get('composite_recall_weight', 0.55)
+        composite_precision = training_config.get('composite_precision_weight', 0.25)
+        min_precision = training_config.get('min_precision_threshold', 0.65)
+        
+        # Gradient clipping - use config value or default
+        gradient_clip_norm = training_config.get('gradient_clip_max_norm', 1.0)
+        
+        # LR scheduler parameters
+        lr_reduce_factor = training_config.get('lr_reduce_factor', 0.1)
+        lr_reduce_patience = training_config.get('lr_reduce_patience', 3)
+        lr_min = training_config.get('lr_min', 1e-7)
+        
+        # Focal loss gamma
+        focal_gamma = training_config.get('focal_loss_gamma', 2.5)
+        
+        # Log training mode
+        if use_imagenet_encoder:
+            logger.info("Training from scratch with ImageNet encoder - using optimized parameters")
+            logger.info(f"  Composite weights: dice={composite_dice}, recall={composite_recall}, precision={composite_precision}")
+            logger.info(f"  Min precision: {min_precision}, Gradient clip: {gradient_clip_norm}")
+            logger.info(f"  Focal loss gamma: {focal_gamma}")
+        
         callbacks = [
             PhaseTracker(log_transitions=True),  # Add PhaseTracker first for reliable phase detection
             GradientAccumulation(training_config['accumulation_steps']),
-            GradientClip(max_norm=1.0),  # NEW: Gradient clipping to prevent large updates
-            # UPDATED (2025-02-13): Balanced recall-precision composite score weights with image weights
-            # Previous: dice=0.2, recall=0.6, precision=0.2, min_precision=0.50 - Recall-focused
-            # NEW: dice=0.2, recall=0.5, precision=0.3, min_precision=0.50 - Balanced approach
-            # This change with updated image/class weights achieves 95%+ recall with 50-60% precision
-            CompositeMetricCallback(dice_weight=0.2, recall_weight=0.5, precision_weight=0.3, min_precision=0.50),
+            GradientClip(max_norm=gradient_clip_norm),  # Configurable gradient clipping
+            CompositeMetricCallback(
+                dice_weight=composite_dice, 
+                recall_weight=composite_recall, 
+                precision_weight=composite_precision, 
+                min_precision=min_precision
+            ),
             SaveBestAndLatestModel(
                 monitor='composite_score',
                 model_save_path=models_dir,
@@ -757,20 +815,10 @@ def fine_tune_single_model(
             ),
             ReduceLROnPlateauCustom(
                 monitor='composite_score',
-                factor=0.1,  # Reduce LR by 10x when plateau detected
-                patience=3,  # Wait 3 epochs with no improvement before reducing
-                min_lr=1e-7,  # Minimum learning rate threshold
-                mode='max'  # Higher composite_score is better
-            ),
-            # FIXED: Monitor composite_score instead of recall_multi_strip for early stopping
-            # This ensures training stops when the balanced metric plateaus, not just recall
-            # Previous: monitor='recall_multi_strip' - continued training despite low precision
-            # Current: monitor='composite_score' - stops when overall performance (including precision) plateaus
-            EarlyStoppingRecall(
-                monitor='composite_score',
-                frozen_patience=1,  # Short patience for frozen phase (cloud segmentation improves quickly)
-                unfrozen_patience=7,  # Longer patience for unfrozen phase (encoder adaptation)
-                min_delta=0.001
+                factor=lr_reduce_factor,
+                patience=lr_reduce_patience,
+                min_lr=lr_min,
+                mode='max'
             ),
         ]
 
@@ -782,7 +830,7 @@ def fine_tune_single_model(
             model=model,
             loss_func=FocalLossFlatImageTypeWeighted(
                 class_weights=training_config['class_weights'],
-                gamma=2.5  # UPDATED (2025-02-13): Moderate focus on hard examples (was 3.0)
+                gamma=focal_gamma
             ),
             metrics=[DiceMultiStrip, RecallMultiStrip, PrecisionMultiStrip, IoUMultiStrip],
             cbs=callbacks,
@@ -835,7 +883,7 @@ def fine_tune_single_model(
         try:
             learner.fit_one_cycle(
                 training_config['freeze_epochs'],
-                get_lr_ranges(freeze_encoder=True)
+                get_lr_ranges(freeze_encoder=True, training_config=training_config)
             )
             logger.info("[DIAGNOSTIC] Frozen phase training completed normally (no early stop)")
         except CancelTrainException as e:
@@ -863,7 +911,7 @@ def fine_tune_single_model(
         print_frozen_status(learner)
         learner.fit_one_cycle(
             training_config['unfrozen_epochs'],
-            get_lr_ranges(freeze_encoder=False)
+            get_lr_ranges(freeze_encoder=False, training_config=training_config)
         )
         logger.info(f"[DIAGNOSTIC] Unfrozen phase training completed")
 
@@ -876,7 +924,7 @@ def fine_tune_single_model(
         # We now save additional formats and verify integrity
         
         # Get the best model info from the callback
-        save_best_callback = learner.cbs[-4]  # The last callback is our SaveBestAndLatestModel
+        save_best_callback = learner.cbs[-3]  # The last callback is our SaveBestAndLatestModel
         best_composite_score = save_best_callback.best_score
         best_epoch = save_best_callback.best_epoch
         
@@ -927,7 +975,7 @@ def fine_tune_single_model(
             "use_bf16": training_config['use_bf16'],
             "demo_mode": training_config['demo_mode'],
             "original_image_size": training_config['original_image_size'],
-            "max_clip_image_clip_size": training_config['max_clip_image_clip_size'],
+            "max_clip_image_size": training_config['max_clip_image_size'],
             "min_clip_image_size": training_config['min_clip_image_size'],
             "limited_band_read_list": training_config['limited_band_read_list'],
             "native_band_scales": training_config['native_band_scales'],
@@ -1086,7 +1134,8 @@ def fine_tune_single_model_two_stage(
             model_config,
             num_input_channels=training_config['num_input_channels'],
             use_bf16=training_config['use_bf16'],
-            compile_model=training_config.get('compile_models', False)
+            compile_model=training_config.get('compile_models', False),
+            use_imagenet_encoder=training_config.get('use_imagenet_encoder', False)
         )
         
         if model is None:
@@ -1306,13 +1355,23 @@ def fine_tune_single_model_two_stage(
                 max_scale=1.111, min_scale=0.07, plateau_min=0.33, plateau_max=1.0
             ),
             RandomClipLargeImages(
-                max_size=training_config['max_clip_image_clip_size'],
+                max_size=training_config['max_clip_image_size'],
                 min_size=training_config['min_clip_image_size']
             ),
             BatchFlip(),
             RandomSharpenBlur(min_factor=0.5, max_factor=1.5),
             ClipHighAndLow(p=0.1, max_pct=0.05),
         ]
+        
+        # Add cloud-specific augmentations for training from scratch
+        if use_imagenet_encoder:
+            # More aggressive augmentation for training from scratch
+            batch_tfms.extend([
+                RandomBrightnessContrast(p=0.5, brightness_range=0.2, contrast_range=0.2),
+                # RandomBandDropout(p=0.1, max_bands_to_drop=1),
+                CloudAwareCutout(p=0.3, max_area_ratio=0.2, min_area_ratio=0.05),
+            ])
+            logger.info("Added cloud-specific augmentations for training from scratch")
         
         # --- DATALOADER ---
         logger.info("Creating DataBlock...")
@@ -1428,7 +1487,7 @@ def fine_tune_single_model_two_stage(
         try:
             stage1_learner.fit_one_cycle(
                 training_config['freeze_epochs'],
-                get_lr_ranges(freeze_encoder=True)
+                get_lr_ranges(freeze_encoder=True, training_config=training_config)
             )
         except CancelTrainException:
             logger.info("Stage 1 frozen phase early stopped, continuing to unfrozen...")
@@ -1439,7 +1498,7 @@ def fine_tune_single_model_two_stage(
         try:
             stage1_learner.fit_one_cycle(
                 training_config['unfrozen_epochs'],
-                get_lr_ranges(freeze_encoder=False)
+                get_lr_ranges(freeze_encoder=False, training_config=training_config)
             )
         except CancelFitException:
             logger.info("Stage 1 training stopped by early stopping")
@@ -1523,7 +1582,7 @@ def fine_tune_single_model_two_stage(
         try:
             stage2_learner.fit_one_cycle(
                 training_config['freeze_epochs'],
-                get_lr_ranges(freeze_encoder=True)
+                get_lr_ranges(freeze_encoder=True, training_config=training_config)
             )
         except CancelTrainException:
             logger.info("Stage 2 frozen phase early stopped, continuing to unfrozen...")
@@ -1534,7 +1593,7 @@ def fine_tune_single_model_two_stage(
         try:
             stage2_learner.fit_one_cycle(
                 training_config['unfrozen_epochs'],
-                get_lr_ranges(freeze_encoder=False)
+                get_lr_ranges(freeze_encoder=False, training_config=training_config)
             )
         except CancelFitException:
             logger.info("Stage 2 training stopped by early stopping")
@@ -1598,7 +1657,7 @@ def fine_tune_single_model_two_stage(
             "use_bf16": training_config['use_bf16'],
             "demo_mode": training_config['demo_mode'],
             "original_image_size": training_config['original_image_size'],
-            "max_clip_image_clip_size": training_config['max_clip_image_clip_size'],
+            "max_clip_image_size": training_config['max_clip_image_size'],
             "min_clip_image_size": training_config['min_clip_image_size'],
             "limited_band_read_list": training_config['limited_band_read_list'],
             "native_band_scales": training_config['native_band_scales'],
@@ -1924,7 +1983,7 @@ def main():
     compile_models = COMPILE_MODELS
     
     original_image_size = ORIGINAL_IMAGE_SIZE
-    max_clip_image_clip_size = MAX_CLIP_IMAGE_SIZE
+    max_clip_image_size = MAX_CLIP_IMAGE_SIZE
     min_clip_image_size = MIN_CLIP_IMAGE_SIZE
     
     # Use configurable band order
@@ -2034,7 +2093,7 @@ def main():
             'model_version': model_version,
             'num_input_channels': num_input_channels,
             'original_image_size': original_image_size,
-            'max_clip_image_clip_size': max_clip_image_clip_size,
+            'max_clip_image_size': max_clip_image_size,
             'min_clip_image_size': min_clip_image_size,
             'limited_band_read_list': limited_band_read_list,
             'native_band_scales': native_band_scales,

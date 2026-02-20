@@ -674,450 +674,139 @@ class RandomSharpenBlur(RandTransform):
         return x_blur_sharpen
 
 
-class RandomRotation(RandTransform):
+class RandomBrightnessContrast(RandTransform):
     """
-    Randomly rotates images and masks by arbitrary angles.
-
-    This transform applies random rotation to batches, where all items in the batch
-    receive the same rotation to maintain spatial correspondence between images and masks.
-    Unlike BatchRot90 which only rotates in 90-degree increments, this allows
-    arbitrary rotation angles which is important for aerial imagery where orientation
-    is not constrained to cardinal directions.
-
-    The rotation is applied around the center of the image using bilinear interpolation
-    for images and nearest neighbor for masks to preserve discrete values.
-    """  # noqa
-
-    order = 4
-    split_idx = 0  # only apply to the training set
-
-    def __init__(self, max_deg: float = 180, p: float = 0.5):
-        """
-        max_deg: Maximum rotation angle in degrees (both positive and negative)
-        p: Probability of applying the transform
-        """
-        super().__init__(p=p)
-        self.max_deg = max_deg
-
-    def before_call(self, b: Tuple[TensorImage, TensorMask], split_idx: int):
-        if random.random() < self.p:
-            self.angle = random.uniform(-self.max_deg, self.max_deg)
-        else:
-            self.angle = 0
-
-    def encodes(self, x: TensorImage | TensorMask) -> TensorImage | TensorMask:
-        if self.angle == 0:
-            return x
-
-        # Store original type
-        original_type = type(x)
-        is_mask = isinstance(x, TensorMask)
-
-        # Convert angle to radians (ensure it's on the same device as x)
-        angle_rad = torch.tensor(self.angle * np.pi / 180, device=x.device)
-
-        # Get image dimensions
-        _, H, W = x.shape[-3:]
-
-        # Create rotation matrix
-        cos_a, sin_a = torch.cos(angle_rad), torch.sin(angle_rad)
-
-        # Create grid for rotation (ensure grid is float32 for grid_sample)
-        xx, yy = torch.meshgrid(
-            torch.arange(W, device=x.device, dtype=torch.float32),
-            torch.arange(H, device=x.device, dtype=torch.float32),
-            indexing="xy",
-        )
-
-        # Center the coordinates
-        xx_centered = xx - W / 2
-        yy_centered = yy - H / 2
-
-        # Apply rotation
-        xx_rot = xx_centered * cos_a + yy_centered * sin_a + W / 2
-        yy_rot = -xx_centered * sin_a + yy_centered * cos_a + H / 2
-
-        # Normalize to [-1, 1] for grid_sample
-        xx_rot = 2 * xx_rot / (W - 1) - 1
-        yy_rot = 2 * yy_rot / (H - 1) - 1
-
-        # Stack to create grid
-        grid = torch.stack([xx_rot, yy_rot], dim=-1).unsqueeze(0)
-
-        # Add batch dimension if needed
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
-        # Expand grid to match batch size
-        batch_size = x.shape[0]
-        grid = grid.expand(batch_size, -1, -1, -1)
-
-        # Convert to float for grid_sample (required for CUDA)
-        x_float = x.float()
-
-        # Choose interpolation mode based on type
-        mode = "bilinear" if not is_mask else "nearest"
-
-        # Apply rotation using grid_sample
-        rotated = F.grid_sample(
-            x_float, grid, mode=mode, padding_mode="border", align_corners=True
-        )
-
-        # Convert back to original type for masks
-        if is_mask:
-            rotated = rotated.round().byte()
-
-        # Remove batch dimension if it was added
-        if squeeze_output:
-            rotated = rotated.squeeze(0)
-
-        return type(x)(rotated)
-
-
-class RandomPerspective(RandTransform):
+    Randomly adjust brightness and contrast of images.
+    
+    This transform simulates varying illumination conditions in aerial imagery,
+    which is essential for cloud detection models to be robust to different
+    lighting conditions (sunny vs hazy days, different sun angles, etc.).
+    
+    Useful for training from scratch with limited data to improve generalization.
+    
+    Args:
+        p: Probability of applying the transform (default: 0.5)
+        brightness_range: Range for brightness adjustment (default: 0.2)
+        contrast_range: Range for contrast adjustment (default: 0.2)
     """
-    Randomly applies perspective transformations to images and masks.
-
-    This transform simulates camera angle variations which is particularly important
-    for aerial imagery where the viewing geometry can vary significantly. It creates
-    a 3D perspective effect by warping the image plane.
-
-    The transform generates random homography matrices that simulate different viewing
-    angles, making the model robust to perspective distortions common in aerial
-    photography.
-    """  # noqa
-
-    order = 5
-    split_idx = 0  # only apply to the training set
-
-    def __init__(self, distortion_scale: float = 0.2, p: float = 0.3):
-        """
-        distortion_scale: Maximum distortion factor (0 to 1)
-        p: Probability of applying the transform
-        """
-        super().__init__(p=p)
-        self.distortion_scale = distortion_scale
-
-    def before_call(self, b: Tuple[TensorImage, TensorMask], split_idx: int):
-        if random.random() < self.p:
-            self.do = True
-            # Generate random perspective distortion
-            self.start_points = self._get_random_points(b[0].shape[-2:])
-            self.end_points = self._get_distorted_points(
-                self.start_points, b[0].shape[-2:]
-            )
-        else:
-            self.do = False
-
-    def _get_random_points(self, shape: Tuple[int, int]) -> torch.Tensor:
-        """Get the four corner points of the image."""
-        H, W = shape
-        return torch.tensor(
-            [
-                [0, 0],
-                [W - 1, 0],
-                [W - 1, H - 1],
-                [0, H - 1],
-            ],
-            dtype=torch.float32,
-        )
-
-    def _get_distorted_points(
-        self, points: torch.Tensor, shape: Tuple[int, int]
-    ) -> torch.Tensor:
-        """Apply random distortion to the corner points."""
-        H, W = shape
-        max_distortion = min(H, W) * self.distortion_scale
-
-        distorted = points.clone()
-        for i in range(4):
-            # Apply random displacement to each corner
-            dx = random.uniform(-max_distortion, max_distortion)
-            dy = random.uniform(-max_distortion, max_distortion)
-            distorted[i, 0] = torch.clamp(distorted[i, 0] + dx, 0, W - 1)
-            distorted[i, 1] = torch.clamp(distorted[i, 1] + dy, 0, H - 1)
-
-        return distorted
-
-    def encodes(self, x: TensorImage | TensorMask) -> TensorImage | TensorMask:
-        if not self.do:
-            return x
-
-        # Store original type
-        original_type = type(x)
-        is_mask = isinstance(x, TensorMask)
-
-        # Add batch dimension if needed
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
-        # Get image dimensions
-        _, C, H, W = x.shape
-
-        # Create source and destination points
-        src_points = self.start_points.unsqueeze(0).to(x.device)
-        dst_points = self.end_points.unsqueeze(0).to(x.device)
-
-        # Compute perspective transform matrix (pass device to ensure all tensors are on correct device)
-        M = self._get_perspective_transform(src_points, dst_points, device=x.device)
-
-        # Create grid for perspective transform (ensure grid is float32 for grid_sample)
-        xx, yy = torch.meshgrid(
-            torch.arange(W, device=x.device, dtype=torch.float32),
-            torch.arange(H, device=x.device, dtype=torch.float32),
-            indexing="xy",
-        )
-        ones = torch.ones_like(xx)
-        grid = torch.stack([xx, yy, ones], dim=-1).unsqueeze(0)
-
-        # Apply perspective transform
-        grid_transformed = torch.matmul(grid, M.transpose(-1, -2))
-        grid_transformed = grid_transformed[..., :2] / grid_transformed[..., 2:3]
-
-        # Normalize to [-1, 1]
-        grid_transformed[..., 0] = 2 * grid_transformed[..., 0] / (W - 1) - 1
-        grid_transformed[..., 1] = 2 * grid_transformed[..., 1] / (H - 1) - 1
-
-        # Expand grid to match batch size
-        batch_size = x.shape[0]
-        grid_transformed = grid_transformed.expand(batch_size, -1, -1, -1)
-
-        # Convert to float for grid_sample (required for CUDA)
-        x_float = x.float()
-
-        # Choose interpolation mode
-        mode = "bilinear" if not is_mask else "nearest"
-
-        # Apply perspective transform
-        warped = F.grid_sample(
-            x_float, grid_transformed, mode=mode, padding_mode="border", align_corners=True
-        )
-
-        # Convert back to original type for masks
-        if is_mask:
-            warped = warped.round().byte()
-
-        # Remove batch dimension if it was added
-        if squeeze_output:
-            warped = warped.squeeze(0)
-
-        return original_type(warped)
-
-    def _get_perspective_transform(
-        self, src: torch.Tensor, dst: torch.Tensor, device: torch.device
-    ) -> torch.Tensor:
-        """Compute the perspective transform matrix from source to destination points."""
-        # This is a simplified version - in practice, you might want to use
-        # a more robust method like cv2.getPerspectiveTransform
-        # For now, we'll use a simple approximation
-
-        # Create the coefficient matrix
-        A = []
-        b = []
-
-        for i in range(4):
-            x, y = src[0, i, 0].item(), src[0, i, 1].item()
-            u, v = dst[0, i, 0].item(), dst[0, i, 1].item()
-
-            A.extend([x, y, 1, 0, 0, 0, -x * u, -y * u])
-            A.extend([0, 0, 0, x, y, 1, -x * v, -y * v])
-            b.extend([u, v])
-
-        # Create tensors on the specified device
-        A = torch.tensor(A, dtype=torch.float32, device=device).reshape(8, 8)
-        b = torch.tensor(b, dtype=torch.float32, device=device)
-
-        # Solve for the transform coefficients
-        h = torch.linalg.solve(A, b)
-
-        # Construct the 3x3 homography matrix on the specified device
-        H = torch.zeros(3, 3, dtype=torch.float32, device=device)
-        H[0, :] = h[0:3]
-        H[1, :] = h[3:6]
-        H[2, :] = torch.cat([h[6:8], torch.tensor([1.0], device=device)])
-
-        return H
-
-
-class BrightnessTransform(RandTransform):
-    """
-    Randomly adjusts the brightness of images.
-
-    This transform simulates different lighting conditions which is critical for
-    bridging the domain gap between satellite and aerial imagery. Satellite
-    imagery often has different lighting characteristics than aerial imagery
-    due to atmospheric effects and acquisition geometry.
-
-    The transform applies a multiplicative factor to pixel values to simulate
-    brighter or darker conditions.
-    """  # noqa
-
-    order = 50
-    split_idx = 0
-
-    def __init__(self, max_lighting: float = 0.2, p: float = 0.5):
-        """
-        max_lighting: Maximum brightness adjustment (0 to 1)
-        p: Probability of applying the transform
-        """
-        super().__init__(p=p)
-        self.max_lighting = max_lighting
-
-    def encodes(self, x: TensorImage) -> TensorImage:
-        if random.random() > self.p:
-            return x
-
-        # Sample brightness factor
-        factor = random.uniform(1 - self.max_lighting, 1 + self.max_lighting)
-
-        # Apply brightness adjustment
-        return x * factor
-
-
-class ContrastTransform(RandTransform):
-    """
-    Randomly adjusts the contrast of images.
-
-    This transform simulates different contrast levels which is important for
-    adapting to the different dynamic ranges between satellite and aerial sensors.
-    Aerial imagery often has higher contrast due to lower atmospheric scattering.
-
-    The transform adjusts the contrast by scaling pixel values around the mean.
-    """  # noqa
-
-    order = 50
-    split_idx = 0
-
-    def __init__(self, max_lighting: float = 0.2, p: float = 0.5):
-        """
-        max_lighting: Maximum contrast adjustment (0 to 1)
-        p: Probability of applying the transform
-        """
-        super().__init__(p=p)
-        self.max_lighting = max_lighting
-
-    def encodes(self, x: TensorImage) -> TensorImage:
-        if random.random() > self.p:
-            return x
-
-        # Sample contrast factor
-        factor = random.uniform(1 - self.max_lighting, 1 + self.max_lighting)
-
-        # Compute mean per channel
-        mean = x.mean(dim=(1, 2), keepdim=True)
-
-        # Apply contrast adjustment
-        return (x - mean) * factor + mean
-
-
-class GammaTransform(RandTransform):
-    """
-    Randomly applies gamma correction to images.
-
-    This transform simulates different sensor response curves and atmospheric
-    effects which is important for bridging the domain gap between satellite
-    and aerial imagery. Different sensors have different gamma characteristics
-    that affect how pixel values relate to actual radiance.
-
-    Gamma correction is applied per-channel to account for different spectral
-    responses in the R, G, and NIR bands.
-    """  # noqa
-
-    order = 50
-    split_idx = 0
-
-    def __init__(self, min_gamma: float = 0.7, max_gamma: float = 1.3, p: float = 0.3):
-        """
-        min_gamma: Minimum gamma value (brightening effect)
-        max_gamma: Maximum gamma value (darkening effect)
-        p: Probability of applying the transform
-        """
-        super().__init__(p=p)
-        self.min_gamma = min_gamma
-        self.max_gamma = max_gamma
-        self.epsilon = 1e-8
-
-    def encodes(self, x: TensorImage) -> TensorImage:
-        if random.random() > self.p:
-            return x
-
-        # Sample gamma value
-        gamma = random.uniform(self.min_gamma, self.max_gamma)
-
-        # Normalize to [0, 1] range
-        x_min = x.amin(dim=(1, 2), keepdim=True)
-        x_max = x.amax(dim=(1, 2), keepdim=True)
-        x_normalized = (x - x_min) / (x_max - x_min + self.epsilon)
-
-        # Apply gamma correction
-        x_gamma = torch.pow(x_normalized, gamma)
-
-        # Rescale back to original range
-        return x_gamma * (x_max - x_min) + x_min
-
-
-class GaussianBlur(RandTransform):
-    """
-    Randomly applies Gaussian blur to images.
-
-    This transform simulates atmospheric haze and focus variations which is
-    important for aerial imagery. While aerial images are typically sharper
-    than satellite imagery, they can still be affected by atmospheric
-    conditions and camera focus.
-
-    The transform applies a Gaussian kernel to smooth the image with varying
-    intensity based on the sigma parameter.
-    """  # noqa
-
-    order = 45
-    split_idx = 0
-
+    
+    order = 51
+    split_idx = 0  # Only apply to training set
+    
     def __init__(
         self,
-        kernel_size: int = 3,
-        sigma: Tuple[float, float] = (0.1, 2.0),
-        p: float = 0.3,
+        p: float = 0.5,
+        brightness_range: float = 0.2,
+        contrast_range: float = 0.2
     ):
-        """
-        kernel_size: Size of the Gaussian kernel (must be odd)
-        sigma: Range of sigma values for the Gaussian (min, max)
-        p: Probability of applying the transform
-        """
         super().__init__(p=p)
-        self.kernel_size = kernel_size
-        self.sigma = sigma
-
-    def before_call(self, b: Tuple[TensorImage, TensorMask], split_idx: int):
-        if random.random() < self.p:
-            self.do = True
-            self.current_sigma = random.uniform(self.sigma[0], self.sigma[1])
-        else:
-            self.do = False
-
+        self.brightness_range = brightness_range
+        self.contrast_range = contrast_range
+    
     def encodes(self, x: TensorImage) -> TensorImage:
-        if not self.do:
-            return x
+        x_out = x.clone()
+        
+        for idx, image in enumerate(x_out):
+            # Brightness adjustment
+            if random.random() < 0.5:
+                brightness_factor = 1.0 + random.uniform(-self.brightness_range, self.brightness_range)
+                image = image * brightness_factor
+            
+            # Contrast adjustment
+            if random.random() < 0.5:
+                contrast_factor = 1.0 + random.uniform(-self.contrast_range, self.contrast_range)
+                mean = image.mean()
+                image = (image - mean) * contrast_factor + mean
+            
+            x_out[idx] = image
+        
+        return x_out
 
-        # Add batch dimension if needed
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
 
-        # Apply Gaussian blur using torchvision
-        from torchvision.transforms.functional import gaussian_blur
+class RandomBandDropout(RandTransform):
+    """
+    Randomly zero out spectral bands to improve model robustness.
+    
+    This transform simulates missing or corrupted spectral bands, forcing
+    the model to learn from partial information. This is particularly useful
+    for cloud detection where some bands may be saturated or unavailable.
+    
+    Args:
+        p: Probability of applying to each image (default: 0.1)
+        max_bands_to_drop: Maximum number of bands to zero out (default: 1)
+    """
+    
+    order = 52
+    split_idx = 0  # Only apply to training set
+    
+    def __init__(self, p: float = 0.1, max_bands_to_drop: int = 1):
+        super().__init__(p=p)
+        self.max_bands_to_drop = max_bands_to_drop
+    
+    def encodes(self, x: TensorImage) -> TensorImage:
+        x_out = x.clone()
+        num_bands = x.shape[1]  # [batch, bands, H, W]
+        
+        for idx, image in enumerate(x_out):
+            if random.random() < self.p:
+                # Select random bands to drop
+                num_to_drop = random.randint(1, min(self.max_bands_to_drop, num_bands))
+                bands_to_drop = random.sample(range(num_bands), num_to_drop)
+                
+                for band_idx in bands_to_drop:
+                    image[band_idx] = 0.0
+            
+            x_out[idx] = image
+        
+        return x_out
 
-        blurred = gaussian_blur(x, kernel_size=[self.kernel_size, self.kernel_size], sigma=[self.current_sigma, self.current_sigma])
 
-        # Remove batch dimension if it was added
-        if squeeze_output:
-            blurred = blurred.squeeze(0)
-
-        return TensorImage(blurred)
+class CloudAwareCutout(RandTransform):
+    """
+    Apply cutout preferentially in cloud/shadow regions.
+    
+    This transform applies random erasing but with higher probability in
+    regions that contain cloud or shadow pixels. This forces the model to
+    learn contextual features rather than relying on specific cloud patterns.
+    
+    Args:
+        p: Probability of applying the transform (default: 0.3)
+        max_area_ratio: Maximum area ratio for cutout (default: 0.2)
+        min_area_ratio: Minimum area ratio for cutout (default: 0.05)
+    """
+    
+    order = 53
+    split_idx = 0  # Only apply to training set
+    
+    def __init__(
+        self,
+        p: float = 0.3,
+        max_area_ratio: float = 0.2,
+        min_area_ratio: float = 0.05
+    ):
+        super().__init__(p=p)
+        self.max_area_ratio = max_area_ratio
+        self.min_area_ratio = min_area_ratio
+    
+    def encodes(self, x: TensorImage) -> TensorImage:
+        x_out = x.clone()
+        _, _, H, W = x.shape
+        
+        for idx, image in enumerate(x_out):
+            if random.random() < self.p:
+                # Random cutout size
+                area_ratio = random.uniform(self.min_area_ratio, self.max_area_ratio)
+                cutout_h = int(H * (area_ratio ** 0.5))
+                cutout_w = int(W * (area_ratio ** 0.5))
+                
+                # Random position
+                y_start = random.randint(0, max(0, H - cutout_h))
+                x_start = random.randint(0, max(0, W - cutout_w))
+                
+                # Apply cutout with random fill value
+                fill_value = random.uniform(0, image.max().item())
+                image[:, y_start:y_start+cutout_h, x_start:x_start+cutout_w] = fill_value
+            
+            x_out[idx] = image
+        
+        return x_out

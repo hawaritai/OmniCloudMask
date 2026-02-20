@@ -29,7 +29,6 @@ try:
         PREPARE_MASKS_TFW_DIR,
         PROJECT_CONFIGS,
         CLASS_MAPPING,
-        SYNONYMS,
     )
     IMAGE_DIR = PREPARE_MASKS_IMAGE_DIR
     GPKG_DIR = PREPARE_MASKS_GPKG_DIR
@@ -51,8 +50,8 @@ def detect_project_type(filename):
         25FD8205Ax00016_10808.tif -> D82A
         25FD0905Ex07650_07650.tif -> D09E
         25FD0905Dx_40007_008715.tif -> D09D
-        08048-qvRGB.jpg -> FHSTG
-        199002098_0053_01_0191_P00_01.iiq -> PHKIO
+        08048-qvRGB.tif -> FHSTG (or DRONTEN)
+        199002098_0053_01_0191_P00_01.tif -> PHKIO
     """
     filename = str(filename)
     
@@ -66,19 +65,25 @@ def detect_project_type(filename):
         if code in PROJECT_CONFIGS:
             return code
     
-    # Pattern for FHSTG: contains "qvRGB"
-    if "qvRGB" in filename:
-        if ".tif" in filename:
-            return "GLSDF"
-        else:
-            return "FHSTG"
-    
-    # Pattern for PHKIO: contains .iiq
-    if ".iiq" in filename:
+    # Pattern for PHKIO: 9digits_4digits_2digits_4digits_Pxx_2digits
+    # Example: 199002098_0053_01_0191_P00_01.tif
+    if re.search(r'\d{9}_\d{4}_\d{2}_\d{4}_P\d{2}_\d{2}', filename):
         return "PHKIO"
+    
+    # Pattern for FHSTG/DRONTEN: contains "qvRGB"
+    if "qvRGB" in filename:
+        # Need additional logic to distinguish FHSTG from DRONTEN
+        # Option 1: Check for specific patterns in filename
+        # e.g., if filename starts with digits followed by dash
+        if re.match(r'^\d+-qvRGB', filename):
+            return "FHSTG"
+        # Option 2: Check for other distinguishing characteristics
+        # Add your specific logic here based on filename patterns
+        return "FHSTG"  # or "DRONTEN" as default
     
     # Default: Could not detect
     return None
+
 
 def process_masks():
     if not IMAGE_DIR.exists():
@@ -105,6 +110,8 @@ def process_masks():
 
     for img_path in tqdm(image_files):
         try:
+            # if not img_path.stem == '00295-qvRGB':
+            #     continue
             # Detect project type
             project_type = detect_project_type(img_path.name)
             
@@ -168,12 +175,12 @@ def process_masks():
                 # Read GPKG
                 gdf = gpd.read_file(gpkg_path)
                 
-                if not any(col in gdf.columns for col in ['Remark', 'Remake', 'Remarks', 'Renark', 'remark', 'Rewmark']):
-                    logger.warning(f"  Warning: 'Remark' column missing in {gpkg_path.name}. Generating black mask.")
+                # Check for normalized 'remark' column
+                if 'remark' not in gdf.columns:
+                    logger.warning(f"  Warning: 'remark' column missing in {gpkg_path.name}. Generating black mask.")
+                    logger.warning(f"           GPKG has not been normalized. Run normalize_gpkg_files.py first.")
+                    stats["no_gpkg"] += 1
                 else:
-                    cols = [c for c in ['Remark', 'Remake', 'Remarks', 'Renark', 'remark', 'Rewmark'] if c in gdf.columns]
-                    if isinstance(cols, list):
-                        cols = cols[0]
                     logger.info(f"  GPKG found with {len(gdf)} features")
                     logger.info(f"  GPKG CRS: {gdf.crs}")
                     logger.info(f"  GPKG Bounds (original): {gdf.total_bounds}")
@@ -218,32 +225,25 @@ def process_masks():
                     
                     logger.info(f"  GPKG Bounds (scaled): {gdf.total_bounds}")
                     
-                    def normalize_tokens(text):
-                        tokens = re.findall(r'\w+', text.lower())
-                        return frozenset(SYNONYMS.get(t, t) for t in tokens)
-
-                    # Build canonical token lookup
-                    CLASS_TOKEN_MAP = {
-                        normalize_tokens(k): v
-                        for k, v in CLASS_MAPPING.items()
-                    }
-
                     shapes_to_burn = []
 
                     for idx, row in gdf.iterrows():
-                        raw_cls = row[cols]
+                        remark_value = row['remark']
 
-                        if not isinstance(raw_cls, str):
+                        if not isinstance(remark_value, str):
                             continue
 
-                        token_set = normalize_tokens(raw_cls)
+                        remark_value = remark_value.strip()
 
-                        # exact semantic match
-                        if token_set in CLASS_TOKEN_MAP:
-                            val = CLASS_TOKEN_MAP[token_set]
-                            shapes_to_burn.append((row['geometry'], val))
+                        # Map normalized remark values to class codes
+                        if remark_value in CLASS_MAPPING:
+                            class_code = CLASS_MAPPING[remark_value]
+                            shapes_to_burn.append((row['geometry'], class_code))
+                        else:
+                            logger.warning(f"    Unknown remark value: '{remark_value}' - skipping")
                     
-                    # Sort by priority (Shadow > Cloud Lite > Cloud Deep)
+                    # Sort by priority (cloud_shadow > thick_cloud > thin_cloud)
+                    # This ensures shadows/clouds are rendered on top
                     shapes_to_burn.sort(key=lambda x: x[1], reverse=True)
                     
                     if shapes_to_burn:
@@ -269,7 +269,7 @@ def process_masks():
                             logger.warning(f"     Shape bounds: {gdf.total_bounds}")
                             stats["failed"] += 1
                     else:
-                        logger.warning(f"  No valid shapes found (check 'Remark' column values)")
+                        logger.warning(f"  No valid shapes found (check 'remark' column values)")
                         stats["no_gpkg"] += 1
             else:
                 # No GPKG, create black mask
@@ -277,7 +277,7 @@ def process_masks():
                 stats["no_gpkg"] += 1
             
             # Save mask
-            out_path = OUTPUT_DIR / f"{img_path.stem}.tif"
+            out_path = OUTPUT_DIR / f"{img_path.stem}.png"
             
             profile = {
                 'driver': 'GTiff',
@@ -311,6 +311,9 @@ def process_masks():
     logger.info(f"\nBy project:")
     for proj, count in stats["by_project"].items():
         logger.info(f"  {proj} ({PROJECT_CONFIGS[proj]['description']}): {count} images")
+    logger.info("\nClass Mapping:")
+    for class_name, class_code in CLASS_MAPPING.items():
+        logger.info(f"  {class_name}: {class_code}")
     logger.info("="*80)
 
 if __name__ == "__main__":

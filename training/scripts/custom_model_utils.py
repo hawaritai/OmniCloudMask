@@ -12,15 +12,17 @@ from omnicloudmask.model_utils import load_model_from_weights, build_model, load
 
 def build_custom_model(
     model_name: str,
-    model_library: str,
+    model_library: str = "smp",
     in_chans: int = 3,
     n_out: int = 4,
     encoder_weights: Optional[str] = None,
 ) -> torch.nn.Module:
-    """Wrapper around omnicloudmask.model_utils.build_model.
+    """Build model with optional ImageNet pre-trained encoder."""
     
-    Maintains compatibility with training scripts while using core logic.
-    """
+    # For timm-efficientnet encoders, use 'imagenet' weights
+    if encoder_weights is None and model_name.startswith('timm-'):
+        encoder_weights = None  # Set to 'imagenet' if you want pretrained
+    
     return build_model(
         model_name=model_name,
         model_library=model_library,

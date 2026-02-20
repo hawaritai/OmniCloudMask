@@ -1,5 +1,6 @@
 from pathlib import Path
 import torch
+import numpy as np
 
 # ==============================================================================
 # LOCAL CONFIGURATION
@@ -12,7 +13,7 @@ import torch
 
 # Centralized Model Versioning
 # Change this in one place to affect training outputs and testing inputs
-CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v14.1" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
+CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v15.1" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
 # CUSTOM_MODEL_VERSION = "OCM_test1x_kavel_n_cloudsen_v10.2" #PM_model_OCM_6.43_RG_NIR_test_merged_100_regnety_004.pycls_in1k_PT_state
 
 # Optimization Settings
@@ -25,7 +26,9 @@ USE_DUAL_RES_METHOD = False
 
 # Common Root for the Dataset (Optional helper)
 # _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\2051_102025077_D09_Arriege_D")
+# _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data\new_vexcel_projects\1731_102024377_Gemeente_Westerwolde_2025")
 _DATASET_ROOT = Path(r"D:\projects\Image_QC_GUI\2_Repos\OmniCloudMask\training\data")
+
 
 # Repo Root (Optional helper, assuming this file is in training/scripts/)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,9 +36,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # ------------------------------------------------------------------------------
 # 2.1. prepare_masks.py / pepare_multiscale_masks.py
 # ------------------------------------------------------------------------------
-PREPARE_MASKS_IMAGE_DIR = _DATASET_ROOT / "all_images"
+PREPARE_MASKS_IMAGE_DIR = _DATASET_ROOT / "all_images_v3"
 PREPARE_MASKS_GPKG_DIR = _DATASET_ROOT / "all_gpkg"
-PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "all_masks_v6"
+PREPARE_MASKS_OUTPUT_DIR = _DATASET_ROOT / "all_masks_v10"
 
 # TFW directory for legacy projects with .tfw files
 PREPARE_MASKS_TFW_DIR = Path(r"Q:\02_PROJECTS\2051_102025082_D82_Tarn-et-Garonne_A\60_UM\LVL03_CertiflAI_0610")
@@ -60,7 +63,7 @@ PREPROCESS_INPUT_LABELS_DIR = PREPARE_MASKS_OUTPUT_DIR
 # PREPROCESS_INPUT_IMAGES_DIR = DUPLICATED_IMAGE_DIR
 # PREPROCESS_INPUT_LABELS_DIR = DUPLICATED_MASK_DIR
 
-PREPROCESS_OUTPUT_DIR = _DATASET_ROOT / "processed_data_upscale_kavel_rgb_v1"
+PREPROCESS_OUTPUT_DIR = _DATASET_ROOT / "processed_data_upscale_kavel_rgb_v4.1_CA"
 
 # ------------------------------------------------------------------------------
 # 2.4. train_ocm_models_custom.py / fine_tune_multiple_models.py
@@ -151,7 +154,7 @@ COMPILE_MODELS = False
 # Class weights for recall-precision balanced training with image weights
 # [Clear, Thick Cloud, Thin Cloud, Cloud Shadow]
 # Ratio: 6:1 (Critical:Clear) - Balanced with image weights
-CLASS_WEIGHTS = [1.0, 1.5, 3.0, 3.0]
+CLASS_WEIGHTS = [0.5, 1.5, 3.0, 3.0]
 
 # ------------------------------------------------------------------------------
 # 3.5. Training Limits
@@ -243,6 +246,14 @@ SMP_MODEL_TYPES = {
     'regnety': 'tu-regnety_004',
     'edgenext': 'tu-edgenext_small',
     'convnext': 'tu-convnextv2_nano',
+    # NEW: Encoders for training from scratch with ImageNet weights
+    'efficientnet_b4': 'timm-efficientnet-b4',
+    'efficientnet_b5': 'timm-efficientnet-b5',
+    'efficientnet_b3': 'timm-efficientnet-b3',
+    'resnet34': 'resnet34',
+    'mit_b3': 'mit_b3',
+    'mit_b4': 'mit_b4',  # Vision Transformer - Best for limited data (speed-focused)
+    'mit_b5': 'mit_b5',  # Vision Transformer - Best for limited data (accuracy-focused)
 }
 
 # Mapping for v3 fastai models
@@ -250,6 +261,77 @@ FASTAI_MODEL_TYPES = {
     'regnety': 'regnety_004.pycls_in1k',
     'edgenext': 'edgenext_small.usi_in1k',
     'convnext': 'convnextv2_nano.fcmae_ft_in1k',
+}
+
+# ------------------------------------------------------------------------------
+# 6.3. Experiment Configurations
+# ------------------------------------------------------------------------------
+# Experiment 2: Train from scratch with ImageNet encoder
+# RECOMMENDED: Vision Transformers (MIT-b5/b4) for limited data
+# Why: Better transfer learning, natural regularization, global receptive field
+EXPERIMENT2_CONFIG = {
+    'name': 'exp2_imagenet_encoder',
+    'encoder_name': 'mit_b5',  # BEST: Vision Transformer for limited data (accuracy-focused)
+                                      # Alternative: 'mit_b4' (speed-focused)
+                                      # CNN alternatives: 'efficientnet_b5', 'efficientnet_b4', 'resnet34'
+    'num_input_channels': 3,  # RGB
+    'use_imagenet_encoder': True,
+    'freeze_encoder_epochs': 20,  # Train decoder first (longer for from-scratch)
+    'unfrozen_epochs': 50,  # Longer training from scratch
+    'learning_rate': 0.001,  # Higher LR for fresh training
+    'batch_size': 4,  # Reduced for larger models (mit_b5 needs more memory)
+    
+    # Regularization strategies (critical for limited data)
+    'dropout_rate': 0.4,  # Higher dropout for ViT (0.3-0.5)
+    'weight_decay': 1e-4,  # L2 regularization
+    'early_stopping_patience': 10,  # Stop if no improvement
+    
+    # Augmentation strategies (essential for limited data)
+    'use_aggressive_augmentation': True,
+    'random_rotation': True,  # 0-360°
+    'random_flip': True,  # Horizontal and vertical
+    'color_jitter': True,  # Brightness/contrast jitter
+    'cloud_specific_aug': True,  # Random shadows, haze, occlusion
+    
+    # Advanced augmentation (optional but recommended)
+    'use_mixup': True,  # Mixup augmentation
+    'use_cutmix': False,  # Cutmix augmentation (can enable if needed)
+    
+    # =========================================================================
+    # TRAINING FROM SCRATCH SPECIFIC PARAMETERS
+    # These override defaults in fine_tune_single_model() when use_imagenet_encoder=True
+    # =========================================================================
+    
+    # Learning Rate Ranges (for discriminative LR during unfrozen phase)
+    # Format: (encoder_lr, decoder_lr) - encoder gets lower LR to preserve pretrained weights
+    'lr_frozen': 1e-3,  # Single LR when encoder is frozen (decoder only)
+    'lr_encoder': 1e-4,  # Encoder LR when unfrozen (lower to preserve ImageNet weights)
+    'lr_decoder': 1e-3,  # Decoder LR when unfrozen (higher for faster learning)
+    
+    # Composite Score Weights (for model selection)
+    # From scratch needs more balanced metrics initially
+    # DISABLE precision guardrail for training from scratch (min_precision=0.0)
+    'composite_dice_weight': 0.3,      # Dice score weight
+    'composite_recall_weight': 0.35,   # Recall weight (balanced)
+    'composite_precision_weight': 0.35, # Precision weight (balanced)
+    'min_precision_threshold': 0.0,    # DISABLED for training from scratch
+    
+    # Focal Loss Parameters
+    # Higher gamma for severe class imbalance (95% clear pixels)
+    'focal_loss_gamma': 2.5,  # Focus parameter (higher = more focus on hard examples)
+    
+    # Class Weights for Training from Scratch
+    # AGGRESSIVE for minority classes with 95% clear pixels
+    # Ratio ~17:1 (Shadow:Clear) to counteract pixel imbalance
+    'class_weights_scratch': torch.tensor([0.3, 2.0, 4.0, 5.0]),  # [Clear, Thick, Thin, Shadow]
+    
+    # Gradient Clipping
+    'gradient_clip_max_norm': 1.0,  # Standard for training from scratch
+    
+    # Learning Rate Scheduler
+    'lr_reduce_factor': 0.1,      # Reduce LR by 10x on plateau
+    'lr_reduce_patience': 7,      # Wait 7 epochs before reducing (higher for from-scratch)
+    'lr_min': 1e-7,               # Minimum LR
 }
 
 # ==============================================================================
@@ -270,10 +352,25 @@ FN_LIST_PATH = Path("training/data/fn_list.txt")
 HARD_NEGATIVES_LIST_PATH = Path("training/data/hard_negatives_list.txt")
 
 # Image weight values
-# Optimized for 95%+ recall with 50-60% precision
-WEIGHT_GT = 1.0             # Ground Truth (baseline)
-WEIGHT_FN = 2.0             # False Negatives (reduced from 3.0 to 2.0 - less aggressive FN learning)
-WEIGHT_HARD_NEGATIVE = 2.0  # Hard Negatives (increased from 0.3 to 0.6 - penalize FPs more)
+# RECOMMENDED for training from scratch with 95% clear pixels:
+# - GT (cloud/shadow): Higher weight to focus on minority classes
+# - Hard Negatives (clear): Lower weight to reduce dominance
+WEIGHT_GT = 3.0             # Ground Truth (cloud/shadow images) - HIGHER weight
+WEIGHT_FN = 1.0             # False Negatives (not used if no FN list)
+WEIGHT_HARD_NEGATIVE = 0.5  # Hard Negatives (clear images) - LOWER weight
+
+# ------------------------------------------------------------------------------
+# 7.2.1. Dynamic Tile Weighting Configuration
+# ------------------------------------------------------------------------------
+# Enable dynamic weighting based on tile content (cloud/shadow ratio)
+# When enabled, each tile gets a weight based on its actual content,
+# not just the source image's list membership.
+USE_DYNAMIC_TILE_WEIGHTS = True
+
+# Dynamic weighting mode:
+# - 'content_ratio': Weight based on cloud/shadow pixel ratio (0.5 to 5.0)
+# - 'class_aware': Weight based on presence of specific classes (shadow=4x, thin=3x, thick=2x, clear=0.5x)
+DYNAMIC_WEIGHT_MODE = 'class_aware'  # Recommended: 'class_aware' for hard class focus
 
 # ------------------------------------------------------------------------------
 # 7.3. Preprocessing Method Toggle
@@ -294,59 +391,57 @@ USE_METHOD_B_PREPROCESSING = False
 PROJECT_CONFIGS = {
     "D82A": {  # Garonne_A - LEGACY with .tfw
         "original_size": (9370, 6020),
-        "current_size": (640, 411),
+        "current_size": (1406, 903),
         "has_tfw": True,  # Special handling for geo-coordinates
         "description": "2051_102025082_D82_Tarn-et-Garonne_A (LEGACY)"
     },
     "D09E": {  # Arriege_E
         "original_size": (4000, 2571),
-        "current_size": (640, 411),
+        "current_size": (1323, 850),
         "has_tfw": False,
         "description": "2051_102025077_D09_Arriege_E"
     },
     "D09D": {  # Arriege_D
         "original_size": (8820, 5668),
-        "current_size": (640, 411),
+        "current_size": (1323, 850),
         "has_tfw": False,
         "description": "2051_102025077_D09_Arriege_D"
     },
     "FHSTG": {  # AIR_FHSTG
         "original_size": (1681, 1080),
-        "current_size": (640, 411),
+        "current_size": (1323, 850),
         "has_tfw": False,
         "description": "2025_08_03_AIR_FHSTG"
     },
     "PHKIO": {  # AIR_PHKIO
         "original_size": (640, 480),
-        "current_size": (640, 480),
+        "current_size": (710, 533),
         "has_tfw": False,
         "description": "2025_08_10_AIR_PHKIO"
     },
-    "GLSDF": {  # GLSDF_UCO42_1101_310525_5cm
-        "original_size": (1422, 1080),
-        "current_size": (1422, 1080),
-        "has_tfw": False,
-        "description": "GLSDF_UCO42_1101_310525_5cm"
-    }
+    # "GLSDF": {  # GLSDF_UCO42_1101_310525_5cm
+    #     "original_size": (1422, 1080),
+    #     "current_size": (1422, 1080),
+    #     "has_tfw": False,
+    #     "description": "GLSDF_UCO42_1101_310525_5cm"
+    # }
+    # "DRONTEN": {  # DRONTEN
+    #     "original_size": (1681, 1080),
+    #     "current_size": (1681, 1080),
+    #     "has_tfw": False,
+    #     "description": "1466_102024325_Gemeente_Dronten_2025"
+    # }
 }
 
 # ------------------------------------------------------------------------------
 # 8.2. Class Mapping
 # ------------------------------------------------------------------------------
-# 'Remark' attribute values -> Integer Class ID
+# --- CLASS MAPPING (after normalization) ---
+# All remark values are now standardized to: thin_cloud, thick_cloud, cloud_shadow
 CLASS_MAPPING = {
-    'Cloud Deep': 1,
-    'Cloud Lite': 2,
-    'Shadow': 3
-}
-
-# Synonym normalization (extendable)
-SYNONYMS = {
-    'light': 'lite',
-    'lite': 'lite',
-    'deep': 'deep',
-    'cloud': 'cloud',
-    'shadow': 'shadow'
+    'thick_cloud': 1,     # Thick/Deep cloud
+    'thin_cloud': 2,      # Thin/Light cloud
+    'cloud_shadow': 3,    # Cloud shadow
 }
 
 # ==============================================================================
